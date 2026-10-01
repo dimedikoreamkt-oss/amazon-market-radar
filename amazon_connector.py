@@ -349,29 +349,32 @@ def validate(out):
 # ---------------------------------------------------------------- 수집
 def collect(args):
     costs = read_csv(args.costs)
-    if not costs: sys.exit("[입력 오류] --costs CSV가 필요합니다 (asin,short,key,cogs,fbaFee,leadtime,safety).")
     brand = env("BRAND_NAME", "", False)
     weeks = week_list(args.weeks)
     S, E = weeks[0].isoformat(), (weeks[-1] + dt.timedelta(days=6)).isoformat()
     E28S = (weeks[-1] - dt.timedelta(days=21)).isoformat()
-    asin_list = [c["asin"] for c in costs]
+    use_ads = bool(os.getenv("ADS_REFRESH_TOKEN") and os.getenv("ADS_PROFILE_ID"))
 
-    print(f"[1/3] Amazon Ads API  ({S} ~ {E})")
-    ads = Ads()
-    base = ["campaignId", "campaignName", "campaignBudgetAmount", "impressions", "clicks", "cost"]
-    sp_c = ads.report("SP campaigns 28d", "SPONSORED_PRODUCTS", "spCampaigns", ["campaign"], base + ["purchases7d", "sales7d"], E28S, E)
-    sb_c = ads.report("SB campaigns 28d", "SPONSORED_BRANDS", "sbCampaigns", ["campaign"], base + ["purchases", "sales", "newToBrandSales"], E28S, E)
-    sd_c = ads.report("SD campaigns 28d", "SPONSORED_DISPLAY", "sdCampaigns", ["campaign"], base + ["purchases", "sales", "newToBrandSales"], E28S, E)
-    terms = ads.report("SP search terms 28d", "SPONSORED_PRODUCTS", "spSearchTerm", ["searchTerm"],
-                       ["searchTerm", "campaignId", "matchType", "keywordType", "impressions", "clicks", "cost", "purchases7d", "sales7d"], E28S, E)
-    # 상품별 광고비 (일별 → 주간). 한 요청은 최대 31일이므로 나눠서 요청
-    ads_daily, cur = [], weeks[0]
-    while cur <= weeks[-1]:
-        end = min(cur + dt.timedelta(days=27), weeks[-1] + dt.timedelta(days=6))
-        rows = ads.report(f"SP advertised product {cur}", "SPONSORED_PRODUCTS", "spAdvertisedProduct", ["advertiser"],
-                          ["date", "advertisedAsin", "cost", "sales7d"], cur.isoformat(), end.isoformat(), time_unit="DAILY")
-        ads_daily += [{"date": r["date"], "asin": r["advertisedAsin"], "cost": r.get("cost"), "sales": r.get("sales7d")} for r in rows]
-        cur = end + dt.timedelta(days=1)
+    sp_c = sb_c = sd_c = terms = []
+    ads_daily = []
+    if use_ads:
+        print(f"[1/3] Amazon Ads API  ({S} ~ {E})")
+        ads = Ads()
+        base = ["campaignId", "campaignName", "campaignBudgetAmount", "impressions", "clicks", "cost"]
+        sp_c = ads.report("SP campaigns 28d", "SPONSORED_PRODUCTS", "spCampaigns", ["campaign"], base + ["purchases7d", "sales7d"], E28S, E)
+        sb_c = ads.report("SB campaigns 28d", "SPONSORED_BRANDS", "sbCampaigns", ["campaign"], base + ["purchases", "sales", "newToBrandSales"], E28S, E)
+        sd_c = ads.report("SD campaigns 28d", "SPONSORED_DISPLAY", "sdCampaigns", ["campaign"], base + ["purchases", "sales", "newToBrandSales"], E28S, E)
+        terms = ads.report("SP search terms 28d", "SPONSORED_PRODUCTS", "spSearchTerm", ["searchTerm"],
+                           ["searchTerm", "campaignId", "matchType", "keywordType", "impressions", "clicks", "cost", "purchases7d", "sales7d"], E28S, E)
+        cur = weeks[0]
+        while cur <= weeks[-1]:
+            end = min(cur + dt.timedelta(days=27), weeks[-1] + dt.timedelta(days=6))
+            rows = ads.report(f"SP advertised product {cur}", "SPONSORED_PRODUCTS", "spAdvertisedProduct", ["advertiser"],
+                              ["date", "advertisedAsin", "cost", "sales7d"], cur.isoformat(), end.isoformat(), time_unit="DAILY")
+            ads_daily += [{"date": r["date"], "asin": r["advertisedAsin"], "cost": r.get("cost"), "sales": r.get("sales7d")} for r in rows]
+            cur = end + dt.timedelta(days=1)
+    else:
+        print("[1/3] Amazon Ads API — 건너뜀 (ADS_REFRESH_TOKEN/ADS_PROFILE_ID 없음 → 광고 화면은 비어 있음)")
 
     print("[2/3] Selling Partner API")
     sp = SP()
@@ -385,6 +388,14 @@ def collect(args):
             m[a] = {"units": f(sa.get("unitsOrdered")), "sales": f((sa.get("orderedProductSales") or {}).get("amount")),
                     "sessions": f(tr.get("sessions")), "buyBox": f(tr.get("buyBoxPercentage"))}
         sales_by_week[w.isoformat()] = m
+    if not costs:   # 원가표가 아직 없으면 판매 리포트에서 ASIN을 찾아 자동 구성 (원가 0 → 손익은 부정확)
+        tot = defaultdict(float)
+        for m in sales_by_week.values():
+            for a, v in m.items(): tot[a] += v["sales"]
+        top = [a for a, v in sorted(tot.items(), key=lambda x: -x[1]) if v > 0][:15]
+        costs = [{"asin": a, "short": a[-5:], "key": a.lower(), "cogs": "", "fbaFee": "", "leadtime": "", "safety": ""} for a in top]
+        print(f"  [안내] 원가표(COSTS_CSV)가 없어 매출 상위 ASIN {len(costs)}개로 자동 구성했습니다. 원가를 넣어야 이익 계산이 정확해집니다.")
+    asin_list = [c["asin"] for c in costs]
     inv_raw = sp.report("GET_FBA_INVENTORY_PLANNING_DATA", tag="now")
     inventory = {r.get("asin"): r for r in tsv(inv_raw)} if isinstance(inv_raw, str) else {}
     for a, r in inventory.items(): price_fb[a] = f(r.get("your-price"))
@@ -446,7 +457,7 @@ def selftest():
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="마켓 레이더 v2 수집기")
     ap.add_argument("--weeks", type=int, default=13, help="수집 주 수 (최소 8, 권장 13)")
-    ap.add_argument("--costs", default=os.getenv("COSTS_CSV"), help="상품 원가·리드타임 CSV 경로/URL (필수, 환경변수 COSTS_CSV 가능)")
+    ap.add_argument("--costs", default=os.getenv("COSTS_CSV"), help="상품 원가·리드타임 CSV 경로/URL (권장, 없으면 판매 상위 ASIN 자동 구성)")
     ap.add_argument("--ranks", default=os.getenv("RANKS_CSV"), help="키워드 자연 순위 CSV 경로/URL (환경변수 RANKS_CSV 가능)")
     ap.add_argument("--reviews", default=os.getenv("REVIEWS_CSV"), help="주간 평점·리뷰 수 CSV 경로/URL (환경변수 REVIEWS_CSV 가능)")
     ap.add_argument("--ipi", default=os.getenv("IPI_SCORE"), help="IPI 점수 (Seller Central 값)")
