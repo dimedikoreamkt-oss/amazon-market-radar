@@ -1,0 +1,50 @@
+# 마켓 레이더 — 매일 자동 업데이트
+# 매일 한국시간 오전 6시: 아마존 API 수집 → 암호화 → GitHub Pages 사이트 갱신
+name: daily-radar
+on:
+  schedule:
+    - cron: "0 21 * * *"        # UTC 21:00 = 한국시간 06:00
+  workflow_dispatch: {}          # Actions 탭에서 "Run workflow"로 즉시 실행
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency: { group: radar, cancel-in-progress: false }
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330         # 아마존 광고 리포트는 생성에 최대 3시간 걸릴 수 있음
+    environment: { name: github-pages, url: "${{ steps.deploy.outputs.page_url }}" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install requests cryptography
+      - name: 지난 리포트 캐시 복원 (확정된 기간은 다시 받지 않음)
+        uses: actions/cache@v4
+        with:
+          path: raw
+          key: raw-${{ github.run_id }}
+          restore-keys: raw-
+      - name: 아마존 데이터 수집 + 암호화
+        env:
+          LWA_CLIENT_ID: ${{ secrets.LWA_CLIENT_ID }}
+          LWA_CLIENT_SECRET: ${{ secrets.LWA_CLIENT_SECRET }}
+          ADS_CLIENT_ID: ${{ secrets.ADS_CLIENT_ID }}
+          ADS_CLIENT_SECRET: ${{ secrets.ADS_CLIENT_SECRET }}
+          ADS_REFRESH_TOKEN: ${{ secrets.ADS_REFRESH_TOKEN }}
+          ADS_PROFILE_ID: ${{ secrets.ADS_PROFILE_ID }}
+          SPAPI_REFRESH_TOKEN: ${{ secrets.SPAPI_REFRESH_TOKEN }}
+          BRAND_NAME: ${{ secrets.BRAND_NAME }}
+          RADAR_PASSWORD: ${{ secrets.RADAR_PASSWORD }}
+          COSTS_CSV: ${{ secrets.COSTS_CSV }}
+          RANKS_CSV: ${{ secrets.RANKS_CSV }}
+          REVIEWS_CSV: ${{ secrets.REVIEWS_CSV }}
+          IPI_SCORE: ${{ vars.IPI_SCORE }}
+        run: |
+          python amazon_connector.py --weeks 13 --encrypt --out radar_data.enc.json
+          mkdir -p _site && cp index.html radar_data.enc.json _site/
+      - uses: actions/upload-pages-artifact@v3
+        with: { path: _site }
+      - id: deploy
+        uses: actions/deploy-pages@v4
