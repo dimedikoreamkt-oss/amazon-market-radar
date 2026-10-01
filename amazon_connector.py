@@ -371,6 +371,53 @@ def validate(out):
 
 # ---------------------------------------------------------------- 자동 수집: 리뷰 주제 · 평점 · 순위
 
+def decrypt_json(pk, password):
+    import base64
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    b = base64.b64decode
+    key = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=b(pk["salt"]), iterations=pk["iter"]).derive(password.encode())
+    return json.loads(AESGCM(key).decrypt(b(pk["iv"]), b(pk["ct"]), None))
+
+def load_products(path="products.enc.json"):
+    """대시보드 '상품' 탭에서 저장한 설정 (원가·리드타임·키워드). 저장소에 암호화되어 올라옴"""
+    if not os.path.exists(path): return {"products": {}}
+    try:
+        with open(path, encoding="utf-8") as fp: d = decrypt_json(json.load(fp), env("RADAR_PASSWORD"))
+        print(f"  · 상품 설정 불러옴: {len(d.get('products', {}))}개 (저장 {d.get('updatedAt', '')})")
+        return d
+    except Exception as e:
+        print(f"  [경고] 상품 설정을 열지 못했습니다(비밀번호가 바뀌었나요?): {e}")
+        return {"products": {}}
+
+def fba_fees(sp):
+    """GET_FBA_ESTIMATED_FBA_FEES_TXT_DATA — 상품별 FBA 배송비·판매수수료 (하루 1회만 요청 가능 → 캐시)"""
+    today = dt.date.today().isoformat(); pth = os.path.join(RAW, f"fbafees_{today}.json")
+    rows = None
+    if os.path.exists(pth):
+        with open(pth, encoding="utf-8") as fp: rows = json.load(fp)
+    else:
+        try:
+            raw = sp.report("GET_FBA_ESTIMATED_FBA_FEES_TXT_DATA", tag="now")
+            rows = tsv(raw) if isinstance(raw, str) else (raw.get("tsv") and tsv(raw["tsv"])) or []
+            os.makedirs(RAW, exist_ok=True)
+            with open(pth, "w", encoding="utf-8") as fp: json.dump(rows, fp)
+        except Exception as e:
+            olds = sorted(x for x in os.listdir(RAW) if x.startswith("fbafees_")) if os.path.isdir(RAW) else []
+            if olds:
+                with open(os.path.join(RAW, olds[-1]), encoding="utf-8") as fp: rows = json.load(fp)
+            print(f"  [안내] 수수료 리포트: {e} → {'지난 값 사용' if rows else '건너뜀'}")
+    out = {}
+    for r in rows or []:
+        a = r.get("asin"); price = f(r.get("your-price")) or f(r.get("sales-price"))
+        ful = f(r.get("expected-domestic-fulfilment-fee-per-unit")) or f(r.get("expected-fulfillment-fee-per-unit"))
+        ref = f(r.get("estimated-referral-fee-per-unit"))
+        if a: out[a] = {"price": price, "fbaFee": round(ful, 2), "refPct": round(ref / price * 100, 1) if price and ref else None,
+                        "name": r.get("product-name", "")}
+    if out: print(f"  · FBA 수수료: {len(out)}개 상품")
+    return out
+
 def catalog_names(sp, asins):
     """SP-API Catalog Items — 실제 상품명·브랜드 (Product Listing 역할). 30일 캐시"""
     out = {}
@@ -600,17 +647,37 @@ def collect(args):
             m[a] = {"units": f(sa.get("unitsOrdered")), "sales": f((sa.get("orderedProductSales") or {}).get("amount")),
                     "sessions": f(tr.get("sessions")), "buyBox": f(tr.get("buyBoxPercentage"))}
         sales_by_week[w.isoformat()] = m
-    if not costs:   # 원가표가 아직 없으면 판매 리포트에서 ASIN을 찾아 자동 구성 (원가 0 → 손익은 부정확)
-        tot = defaultdict(float)
-        for m in sales_by_week.values():
-            for a, v in m.items(): tot[a] += v["sales"]
-        top = [a for a, v in sorted(tot.items(), key=lambda x: -x[1]) if v > 0][:15]
-        costs = [{"asin": a, "short": a[-5:], "key": a.lower(), "cogs": "", "fbaFee": "", "leadtime": "", "safety": ""} for a in top]
-        print(f"  [안내] 원가표(COSTS_CSV)가 없어 매출 상위 ASIN {len(costs)}개로 자동 구성했습니다. 원가를 넣어야 이익 계산이 정확해집니다.")
+    # 상품 목록 = 13주 안에 판매가 있었던 모든 상품 + 상품 탭에 저장된 상품 (자동)
+    settings = load_products()
+    P = settings.get("products", {})
+    tot = defaultdict(float)
+    for m in sales_by_week.values():
+        for a, v in m.items(): tot[a] += v["sales"]
+    found = [a for a, v in sorted(tot.items(), key=lambda x: -x[1]) if v > 0][:int(os.getenv("MAX_PRODUCTS", "50"))]
+    by_csv = {c["asin"]: c for c in costs}
+    all_asins = list(dict.fromkeys(found + list(P) + list(by_csv)))
+    excluded = [a for a in all_asins if P.get(a, {}).get("exclude")]
+    costs = []
+    for a in all_asins:
+        if a in excluded: continue
+        c = dict(by_csv.get(a, {"asin": a, "key": a.lower()}))
+        c.setdefault("key", a.lower())
+        for k in ("short", "cogs", "fbaFee", "leadtime", "safety", "inbound", "refPct", "launch"):
+            v = P.get(a, {}).get(k)
+            if v not in (None, ""): c[k] = v          # 상품 탭 값이 최우선
+        costs.append(c)
+    print(f"  · 상품 {len(costs)}개 (판매 발견 {len(found)}, 제외 {len(excluded)})")
     asin_list = [c["asin"] for c in costs]
     inv_raw = sp.report("GET_FBA_INVENTORY_PLANNING_DATA", tag="now")
     inventory = {r.get("asin"): r for r in tsv(inv_raw)} if isinstance(inv_raw, str) else {}
     for a, r in inventory.items(): price_fb[a] = f(r.get("your-price"))
+    fees = fba_fees(sp)
+    for c in costs:
+        fe = fees.get(c["asin"])
+        if not fe: continue
+        if c.get("fbaFee") in (None, ""): c["fbaFee"] = fe["fbaFee"]
+        if c.get("refPct") in (None, "") and fe["refPct"]: c["refPct"] = fe["refPct"]
+        if fe["price"] and not price_fb.get(c["asin"]): price_fb[c["asin"]] = fe["price"]
     perf = sp.report("GET_V2_SELLER_PERFORMANCE_REPORT", tag="now")
     sqp, sqp_w = {}, {}
     if not args.no_sqp:
@@ -631,15 +698,22 @@ def collect(args):
     themes = {}
     try: themes = review_topics(sp, asin_list)
     except Exception as e: print(f"  [건너뜀] 리뷰 주제: {e}")
-    names = catalog_names(sp, asin_list)
+    names = catalog_names(sp, all_asins)
     for c in costs:   # 원가표에 이름이 없으면 실제 아마존 상품명 사용
         nm = names.get(c["asin"])
         if nm:
             if not c.get("name"): c["name"] = nm["name"][:80]
             if not c.get("short") or c["short"] == c["asin"][-5:]: c["short"] = short_name(nm["name"], nm["brand"] or brand)
-    chosen = [r["keyword"].strip().lower() for r in kw_meta if r.get("keyword")]
+    user_kw = {}   # 상품 탭에서 입력한 키워드 → 상품
+    for a, pz in P.items():
+        if pz.get("exclude"): continue
+        for k in pz.get("keywords") or []:
+            k = str(k).strip().lower()
+            if k: user_kw[k] = {"key": a.lower(), "target": pz.get("target") or ""}
+    kw_meta = kw_meta + [{"keyword": k, "key": v["key"], "target": v["target"]} for k, v in user_kw.items()]
+    chosen = list(dict.fromkeys(list(user_kw) + [r["keyword"].strip().lower() for r in kw_meta if r.get("keyword")]))
     est = keywords_from_sqp(weeks, sqp_w, brand, chosen, int(os.getenv("RANK_KEYWORDS", "15")), costs) if sqp_w else []
-    kw_track = list(dict.fromkeys(chosen + [r["keyword"] for r in est]))[:int(os.getenv("RANK_KEYWORDS", "15"))]
+    kw_track = list(dict.fromkeys(chosen + [r["keyword"] for r in est]))[:max(len(chosen), int(os.getenv("RANK_KEYWORDS", "15")))]
     auto_log = {"ranks": [], "reviews": []}
     if os.getenv("SERPAPI_KEY"):
         restore_serp_log()
@@ -662,7 +736,17 @@ def collect(args):
            "campaigns": build_campaigns(sp_c, sb_c, sd_c, costs), "searchTerms": build_terms(terms, brand),
            "keywords": build_keywords(weeks, ranks_in, sqp, brand, tos),
            "autoLog": auto_log,
+           "productSettings": settings,
+           "allProducts": [{"asin": a, "excluded": a in excluded, "sales13w": round(tot.get(a, 0)),
+                            "name": (names.get(a) or {}).get("name") or (fees.get(a) or {}).get("name") or inventory.get(a, {}).get("product-name", ""),
+                            "price": price_fb.get(a) or (fees.get(a) or {}).get("price"), "fbaFeeAuto": (fees.get(a) or {}).get("fbaFee"),
+                            "refPctAuto": (fees.get(a) or {}).get("refPct")} for a in all_asins],
            "health": build_health(perf, int(args.ipi) if args.ipi else None)}
+    have = {k["keyword"] for k in out["keywords"]}
+    for k, v in user_kw.items():   # 입력했지만 아직 순위 데이터가 없는 키워드도 표에 표시
+        if k not in have:
+            out["keywords"].append({"keyword": k, "key": v["key"], "volume": 0, "rank": [101] * len(weeks), "spRank": None,
+                                    "target": int(f(v["target"])) or None, "noData": True})
     for it in out["asins"]:
         if it["asin"] in themes:
             it["reviewThemes"] = [[t, sh] for t, sh, _ in themes[it["asin"]]]
