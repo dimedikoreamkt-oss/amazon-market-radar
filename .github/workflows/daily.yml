@@ -42,6 +42,8 @@ jobs:
           REVIEWS_CSV: ${{ secrets.REVIEWS_CSV }}
           IPI_SCORE: ${{ vars.IPI_SCORE }}
           KEYWORDS_CSV: ${{ secrets.KEYWORDS_CSV }}
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          SITE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
         run: |
           python amazon_connector.py --weeks 13 --encrypt --out radar_data.enc.json
           mkdir -p _site && cp index.html radar_data.enc.json _site/
