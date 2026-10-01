@@ -2,6 +2,8 @@
 # 매일 한국시간 오전 6시: 아마존 API 수집 → 암호화 → GitHub Pages 사이트 갱신
 name: daily-radar
 on:
+  push:
+    paths: ["products.enc.json"]   # 상품 탭에서 저장하면 바로 다시 수집
   schedule:
     - cron: "0 21 * * *"        # UTC 21:00 = 한국시간 06:00
   workflow_dispatch: {}          # Actions 탭에서 "Run workflow"로 즉시 실행
