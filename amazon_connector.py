@@ -27,6 +27,12 @@ Amazon Ads API(v3)와 Selling Partner API에서 주간 데이터를 받고,
   SITE_URL        (자동) 지난 기록 복원용 사이트 주소
   KEYWORDS_CSV    (선택) 꼭 추적할 키워드 목록 시트 링크: keyword,key,target. 없으면 SQP 검색량 상위 키워드 자동 선택
   RANK_KEYWORDS   자동 선택 키워드 수 (기본 15)
+  FX_FALLBACK     (선택) 하나은행 환율을 하나도 못 받았을 때 쓸 원/달러 환율 (기본 1400)
+
+환율 (자동, 무료)
+  하나은행 매매기준율(USD → 원)을 날짜별로 받아 raw/fx_usdkrw.json 에 쌓습니다. 그날 마지막 고시값.
+  주말·공휴일·고시 전처럼 그날 환율이 없으면 그 전날(직전 영업일) 환율을 씁니다.
+  대시보드는 모든 금액을 원화로 보여 줍니다: 주간 매출은 그 주 7일 환율 평균, 광고비는 날짜별 환율로 환산.
 
 입력 CSV (UTF-8, 첫 줄 머리글)
   costs.csv   asin,short,key,cogs,fbaFee,leadtime,safety,inbound[,refPct][,launch]
@@ -59,6 +65,9 @@ LWA_URL = "https://api.amazon.com/auth/o2/token"
 ADS_HOST = {"NA": "https://advertising-api.amazon.com", "EU": "https://advertising-api-eu.amazon.com", "FE": "https://advertising-api-fe.amazon.com"}
 SP_HOST = {"NA": "https://sellingpartnerapi-na.amazon.com", "EU": "https://sellingpartnerapi-eu.amazon.com", "FE": "https://sellingpartnerapi-fe.amazon.com"}
 RAW = "raw"
+KST = dt.timezone(dt.timedelta(hours=9))
+FX_LOG = os.path.join(RAW, "fx_usdkrw.json")
+HANA_URL = "https://www.kebhana.com/cms/rate/wpfxd651_01i_01.do"
 
 # ---------------------------------------------------------------- 공통
 def env(k, default=None, required=True):
@@ -227,14 +236,14 @@ def match_key(name, costs):
             if cand and cand.lower() in nm: return c["key"]
     return "brand"
 
-def build_asins(weeks, sales_by_week, ads_daily, costs, reviews, inventory, price_fallback):
+def build_asins(weeks, sales_by_week, ads_daily, costs, reviews, inventory, price_fallback, fxd=None):
     """sales_by_week: {weekISO: {asin: {sessions, units, sales, buyBox}}}
        ads_daily: [{date, asin, cost, sales}]  (spAdvertisedProduct DAILY)"""
     W = [w.isoformat() for w in weeks]
-    ad_w = defaultdict(lambda: defaultdict(lambda: [0.0, 0.0]))
+    ad_w = defaultdict(lambda: defaultdict(lambda: [0.0, 0.0, 0.0, 0.0]))   # 달러 광고비·매출, 원화 광고비·매출(날짜별 환율)
     for r in ads_daily:
-        wk = week_start(r["date"]).isoformat()
-        ad_w[r["asin"]][wk][0] += f(r.get("cost")); ad_w[r["asin"]][wk][1] += f(r.get("sales"))
+        wk = week_start(r["date"]).isoformat(); x = (fxd or {}).get(str(r["date"])[:10], {}).get("rate", 0)
+        v = ad_w[r["asin"]][wk]; v[0] += f(r.get("cost")); v[1] += f(r.get("sales")); v[2] += f(r.get("cost")) * x; v[3] += f(r.get("sales")) * x
     rev = defaultdict(dict); themes = {}
     for r in reviews:
         wk_ = min(week_start(r["date"]).isoformat(), W[-1])
@@ -262,6 +271,9 @@ def build_asins(weeks, sales_by_week, ads_daily, costs, reviews, inventory, pric
                 "weeks": {"sessions": [int(x) for x in sessions], "units": [int(x) for x in units], "sales": [round(x) for x in sales],
                           "rating": rt, "reviews": rc, "buyBox": [round(x, 1) for x in bb], "price": [price] * len(W),
                           "adSpend": [round(ad_w[a][w][0]) for w in W], "adSales": [round(ad_w[a][w][1]) for w in W]}}
+        if fxd:
+            item["weeks"]["adSpendKrw"] = [round(ad_w[a][w][2]) for w in W]; item["weeks"]["adSalesKrw"] = [round(ad_w[a][w][3]) for w in W]
+        if f(c.get("cogsKrw")): item["cogsKrw"] = f(c["cogsKrw"])   # 원가는 원화 입력 (상품 탭)
         if c.get("refPct"): item["refPct"] = f(c["refPct"])
         if str(c.get("launch", "")).lower() in ("1", "true", "y", "yes"): item["launch"] = True
         if a in themes: item["reviewThemes"] = themes[a]
@@ -362,7 +374,7 @@ def validate(out):
     W = len(out["weeks"]); probs = []
     for a in out["asins"]:
         if sum(a["weeks"]["sessions"]) == 0: probs.append(f"{a['asin']}: 세션 데이터 없음 (ASIN 오타 또는 판매 없음)")
-        if not a["cogs"]: probs.append(f"{a['asin']}: 원가(cogs) 없음 → 손익 부정확")
+        if not (a["cogs"] or a.get("cogsKrw")): probs.append(f"{a['asin']}: 원가(cogs) 없음 → 손익 부정확")
         if any(x == 0 for x in a["weeks"]["rating"]): probs.append(f"{a['asin']}: 평점 없음 → reviews.csv 확인")
     if not out["keywords"]: probs.append("키워드 순위 없음 → ranks.csv 필요 (순위 계획이 만들어지지 않음)")
     for p in probs: print("  [점검]", p)
@@ -533,24 +545,12 @@ def serp_collect(asins, keywords, today, budget_month=240):
 
 def restore_serp_log():
     """GitHub 캐시가 지워졌을 때 지난번 사이트(암호화 파일)에서 순위·평점 기록 복원"""
-    url, pw = os.getenv("SITE_URL"), os.getenv("RADAR_PASSWORD")
-    if os.path.exists(SERP_LOG) or not (url and pw): return
-    try:
-        import base64, requests
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-        r = requests.get(url.rstrip("/") + "/radar_data.enc.json", timeout=60)
-        if not r.ok: return
-        pk = r.json(); b = base64.b64decode
-        key = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=b(pk["salt"]), iterations=pk["iter"]).derive(pw.encode())
-        h = json.loads(AESGCM(key).decrypt(b(pk["iv"]), b(pk["ct"]), None)).get("autoLog")
-        if h:
-            os.makedirs(RAW, exist_ok=True)
-            with open(SERP_LOG, "w", encoding="utf-8") as fp: json.dump(h, fp, ensure_ascii=False)
-            print(f"  · 지난 순위·평점 기록 복원 ({len(h.get('ranks', []))}+{len(h.get('reviews', []))}행)")
-    except Exception as e:
-        print(f"  [안내] 지난 기록 복원 생략: {e}")
+    if os.path.exists(SERP_LOG): return
+    h = (prev_site_data() or {}).get("autoLog")
+    if h:
+        os.makedirs(RAW, exist_ok=True)
+        with open(SERP_LOG, "w", encoding="utf-8") as fp: json.dump(h, fp, ensure_ascii=False)
+        print(f"  · 지난 순위·평점 기록 복원 ({len(h.get('ranks', []))}+{len(h.get('reviews', []))}행)")
 
 CTR_CURVE = [(1, 25), (2, 15), (3, 11), (4, 8.5), (5, 7), (6, 6), (7, 5), (8, 4.4), (9, 3.9), (10, 3.5), (12, 2.3), (15, 1.6),
              (20, 1.0), (30, 0.5), (45, 0.25), (60, 0.12), (100, 0.05)]   # 대시보드 CTR_DEFAULT와 동일
@@ -601,6 +601,97 @@ def keywords_from_sqp(weeks, sqp_w, brand, chosen, n, costs=()):
     return rows
 
 # ---------------------------------------------------------------- 수집
+# ---------------------------------------------------------------- 환율: 하나은행 매매기준율 (USD/KRW)
+def hana_usdkrw(day):
+    """하나은행 '과거 환율 조회'(최종 고시) → (매매기준율, 실제 기준일). 휴일이면 은행이 직전 영업일 값을 돌려줌"""
+    import html as _h, re, requests
+    d = day.strftime("%Y%m%d")
+    r = requests.post(HANA_URL, timeout=30, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.kebhana.com/cms/rate/index.do"},
+                      data={"ajax": "true", "curCd": "", "tmpInqStrDt": day.isoformat(), "pbldDvCd": "0", "pbldSqn": "",
+                            "inqStrDt": d, "inqKindCd": "1", "requestTarget": "searchContentDiv"})
+    r.raise_for_status(); t = r.text
+    txt = re.sub(r"\s+", " ", _h.unescape(re.sub(r"<[^>]+>", " ", t)))
+    m = re.search(r"기준일\s*:\s*(\d{4})년\s*(\d{2})월\s*(\d{2})일", txt)
+    row = re.search(r"미국\s*USD(.*?)</tr>", t, re.S)
+    if not (m and row): return None
+    cells = [_h.unescape(re.sub(r"<[^>]+>", "", c)).strip() for c in re.findall(r"<td[^>]*>(.*?)</td>", row.group(1), re.S)]
+    # 열 순서: 현찰 살때·스프레드·팔때·스프레드 · 송금 보낼때·받을때 · 수표 팔때 · 매매기준율 · 환가료율 · 미화환산율
+    rate = f(cells[7]) if len(cells) > 7 else 0
+    if not 500 < rate < 5000: return None
+    return rate, f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+def fill_fx(cache, start, end):
+    """날짜별 환율표. 그날 값이 없으면 그 전날 값을 씀 (처음부터 없으면 가장 가까운 다음 값)"""
+    days, d = [], start
+    while d <= end: days.append(d.isoformat()); d += dt.timedelta(days=1)
+    out, last = {}, None
+    for iso in days:
+        v = cache.get(iso)
+        if v:   # 은행이 다른 날(직전 영업일) 값을 돌려줬으면 '그 전날 환율 사용'으로 표시
+            last = (v["rate"], v["base"]); out[iso] = {"rate": v["rate"], "base": v["base"]}
+            if v.get("base") and v["base"] != iso: out[iso]["filled"] = True
+        elif last: out[iso] = {"rate": last[0], "base": last[1], "filled": True}
+    first = next((out[i] for i in days if i in out), None)
+    if first is None:
+        fb = f(os.getenv("FX_FALLBACK")) or 1400.0
+        print(f"  [경고] 환율을 하나도 받지 못해 {fb}원으로 계산합니다 (FX_FALLBACK)")
+        first = {"rate": fb, "base": "", "fallback": True}
+    for iso in days:
+        if iso not in out: out[iso] = dict(first, filled=True)
+    return out
+
+def fx_rates(start, end):
+    """start~end(날짜) 하나은행 매매기준율. 지난 날짜는 한 번만 받고 raw/에 보관 → 매일 실행해도 새 날짜만 요청"""
+    cache = {}
+    if os.path.exists(FX_LOG):
+        with open(FX_LOG, encoding="utf-8") as fp: cache = json.load(fp)
+    else:
+        old = (prev_site_data() or {}).get("fx", {}).get("daily") or []
+        cache = {r[0]: {"rate": r[1], "base": r[2], "final": True} for r in old if not (len(r) > 3 and r[3])}
+        if cache: print(f"  · 지난 사이트에서 환율 {len(cache)}일 복원")
+    today = dt.datetime.now(KST).date(); d, got, fails = start, 0, 0
+    while d <= min(end, today):
+        iso = d.isoformat(); c = cache.get(iso)
+        if not (c and c.get("final")):
+            try:
+                r = hana_usdkrw(d)
+                if r: cache[iso] = {"rate": r[0], "base": r[1], "final": d < today}; got += 1
+            except Exception as e:
+                fails += 1; print(f"  [안내] 하나은행 환율 {iso}: {e}")
+                if fails >= 5: print("  [안내] 환율 조회를 멈추고 받은 값까지만 씁니다"); break
+            time.sleep(0.1)
+        d += dt.timedelta(days=1)
+    os.makedirs(RAW, exist_ok=True)
+    with open(FX_LOG, "w", encoding="utf-8") as fp: json.dump(cache, fp, ensure_ascii=False)
+    print(f"  · 환율(하나은행 매매기준율): 새로 {got}일, 보관 {len(cache)}일")
+    return fill_fx(cache, start, end)
+
+_PREV = {}
+def prev_site_data():
+    """GitHub 캐시가 지워졌을 때 지난번 사이트(암호화 파일)에서 기록 복원"""
+    if "d" in _PREV: return _PREV["d"]
+    _PREV["d"] = None
+    url, pw = os.getenv("SITE_URL"), os.getenv("RADAR_PASSWORD")
+    if not (url and pw): return None
+    try:
+        import requests
+        r = requests.get(url.rstrip("/") + "/radar_data.enc.json", timeout=60)
+        if r.ok: _PREV["d"] = decrypt_json(r.json(), pw)
+    except Exception as e:
+        print(f"  [안내] 지난 사이트 읽기 생략: {e}")
+    return _PREV["d"]
+
+def fx_pack(fxd, weeks, p28_start, p28_end):
+    """대시보드용: 날짜별 표 + 주간 평균(그 주 7일) + 광고 28일 평균 + 최신값"""
+    def avg_range(a, b):
+        xs = [fxd[(a + dt.timedelta(days=i)).isoformat()]["rate"] for i in range((b - a).days + 1) if (a + dt.timedelta(days=i)).isoformat() in fxd]
+        return round(sum(xs) / len(xs), 2) if xs else None
+    last = max(fxd)
+    return {"source": "하나은행 매매기준율 (USD→KRW, 그날 마지막 고시)", "rule": "그날 환율이 없으면 그 전날 환율",
+            "daily": [[k, v["rate"], v.get("base", ""), bool(v.get("filled"))] for k, v in sorted(fxd.items())],
+            "weekly": [avg_range(w, w + dt.timedelta(days=6)) for w in weeks],
+            "p28": avg_range(p28_start, p28_end), "latest": fxd[last]["rate"], "latestDate": last, "latestBase": fxd[last].get("base", "")}
+
 def collect(args):
     costs = read_csv(args.costs)
     brand = env("BRAND_NAME", "", False)
@@ -662,7 +753,7 @@ def collect(args):
         if a in excluded: continue
         c = dict(by_csv.get(a, {"asin": a, "key": a.lower()}))
         c.setdefault("key", a.lower())
-        for k in ("short", "cogs", "fbaFee", "leadtime", "safety", "inbound", "refPct", "launch"):
+        for k in ("short", "cogs", "cogsKrw", "fbaFee", "leadtime", "safety", "inbound", "refPct", "launch"):
             v = P.get(a, {}).get(k)
             if v not in (None, ""): c[k] = v          # 상품 탭 값이 최우선
         costs.append(c)
@@ -728,11 +819,16 @@ def collect(args):
     ranks_in = [dict(r, **{k: v for k, v in meta_by.get(r["keyword"].strip().lower(), {}).items() if k in ("key", "target") and v}) for r in ranks_in]
     reviews_in = [r for r in reviews_in if r.get("rating")]
 
-    print("[3/3] 합치기 · 변환")
-    out = {"meta": {"brand": brand or "우리 브랜드", "marketplace": sp.mp, "currency": "USD", "asOf": dt.date.today().isoformat(),
-                    "generatedAt": dt.datetime.now().isoformat(timespec="seconds"), "sample": False},
+    print("[3/3] 환율 · 합치기 · 변환")
+    as_of = dt.datetime.now(KST).date()
+    fxd = fx_rates(weeks[0], as_of)
+    fx = fx_pack(fxd, weeks, dt.date.fromisoformat(E28S), dt.date.fromisoformat(E))
+    print(f"  · 최신 환율 {fx['latest']:,.2f}원 ({fx['latestDate']}, 기준일 {fx['latestBase']})")
+    out = {"meta": {"brand": brand or "우리 브랜드", "marketplace": sp.mp, "currency": "USD", "asOf": as_of.isoformat(),
+                    "generatedAt": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "sample": False},
+           "fx": fx,
            "weeks": [w.isoformat() for w in weeks],
-           "asins": build_asins(weeks, sales_by_week, ads_daily, costs, reviews_in, inventory, price_fb),
+           "asins": build_asins(weeks, sales_by_week, ads_daily, costs, reviews_in, inventory, price_fb, fxd),
            "campaigns": build_campaigns(sp_c, sb_c, sd_c, costs), "searchTerms": build_terms(terms, brand),
            "keywords": build_keywords(weeks, ranks_in, sqp, brand, tos),
            "autoLog": auto_log,
@@ -785,6 +881,13 @@ def selftest():
     assert a["weeks"]["rating"] == [4.4, 4.4, 4.4, 4.4] and a["reviewThemes"] == [["누수", 30]]
     assert k["rank"] == [5, 6, 7, 8] and abs(k["sqp"]["purchase"] - 7.4) < 1e-6
     assert c["key"] == "serum" and c["targeting"] == "AUTO"
+    fxc = {"2026-09-23": {"rate": 1359.0, "base": "2026-09-23"}, "2026-09-28": {"rate": 1360.0, "base": "2026-09-28"}}
+    fxd = fill_fx(fxc, dt.date(2026, 9, 22), dt.date(2026, 9, 29))
+    assert fxd["2026-09-22"]["rate"] == 1359.0 and fxd["2026-09-26"]["rate"] == 1359.0 and fxd["2026-09-26"]["filled"]
+    assert fxd["2026-09-29"]["rate"] == 1360.0
+    assert fill_fx({"2026-09-27": {"rate": 1359.0, "base": "2026-09-25"}}, dt.date(2026, 9, 27), dt.date(2026, 9, 27))["2026-09-27"]["filled"]
+    a2 = build_asins(weeks, sbw, ads_daily, [dict(costs[0], cogsKrw="8800")], [], {}, {}, fill_fx({W[0]: {"rate": 1400.0, "base": W[0]}}, weeks[0], weeks[-1] + dt.timedelta(days=6)))[0]
+    assert a2["weeks"]["adSpendKrw"] == [98000] * 4 and a2["cogsKrw"] == 8800
     print("selftest 통과:", json.dumps({"asin": a["weeks"], "keyword": k, "campaign": c}, ensure_ascii=False)[:400], "…")
 
 if __name__ == "__main__":
