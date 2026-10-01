@@ -21,10 +21,10 @@ jobs:
         with: { python-version: "3.12" }
       - run: pip install requests cryptography
       - name: 지난 리포트 캐시 복원 (확정된 기간은 다시 받지 않음)
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: raw
-          key: raw-${{ github.run_id }}
+          key: raw-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: raw-
       - name: 아마존 데이터 수집 + 암호화
         env:
@@ -41,10 +41,21 @@ jobs:
           RANKS_CSV: ${{ secrets.RANKS_CSV }}
           REVIEWS_CSV: ${{ secrets.REVIEWS_CSV }}
           IPI_SCORE: ${{ vars.IPI_SCORE }}
+          KEYWORDS_CSV: ${{ secrets.KEYWORDS_CSV }}
         run: |
           python amazon_connector.py --weeks 13 --encrypt --out radar_data.enc.json
           mkdir -p _site && cp index.html radar_data.enc.json _site/
+      - name: 받은 리포트 캐시 저장 (뒤 단계가 실패해도 저장 → 다음 실행이 빨라짐)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: raw
+          key: raw-${{ github.run_id }}-${{ github.run_attempt }}
       - uses: actions/upload-pages-artifact@v3
-        with: { path: _site }
+        with:
+          path: _site
+          name: github-pages-${{ github.run_attempt }}   # 재실행해도 이름이 겹치지 않게
       - id: deploy
         uses: actions/deploy-pages@v4
+        with:
+          artifact_name: github-pages-${{ github.run_attempt }}
