@@ -11,7 +11,8 @@ Amazon Ads API(v3)와 Selling Partner API에서 주간 데이터를 받고,
   python amazon_connector.py --selftest          # API 없이 변환 로직만 점검
   python amazon_connector.py ... --encrypt --out radar_data.enc.json   # 매일 자동 실행(GitHub Actions)용
 
-권장: 매주 월요일 오전(한국시간) 실행. 검색어 리포트는 65일만 보관되므로 원본(raw/)을 쌓아 두세요.
+매일 06시(한국시간) 자동 실행. 판매·방문·광고·재고·환율은 날짜별로 받고, 키워드 점유율(SQP)만 아마존이 주간으로만 제공해 주간입니다.
+지난 날짜는 raw/에 보관해 다시 받지 않습니다 (첫 실행은 91일치를 받느라 1~2시간 걸릴 수 있음).
 
 환경변수 (서버 비밀 저장소에만 — 코드·HTML에 넣지 마세요)
   LWA_CLIENT_ID, LWA_CLIENT_SECRET     SP-API 앱의 LWA 자격증명 (Solution Provider Portal / Develop Apps)
@@ -85,11 +86,11 @@ def save_raw(name, obj):
     with open(os.path.join(RAW, name), "w", encoding="utf-8") as fp:
         json.dump(obj, fp, ensure_ascii=False)
 
-def load_cache(name, end):
-    """끝난 지 15일이 지난 기간의 리포트는 다시 받지 않음 (광고 귀속 확정 이후). 매일 실행해도 API 호출이 늘지 않음."""
+def load_cache(name, end, settle=15):
+    """끝난 지 settle일이 지난 기간의 리포트는 다시 받지 않음 (광고 귀속 확정 이후). 매일 실행해도 API 호출이 늘지 않음."""
     pth = os.path.join(RAW, name)
     try:
-        if end and dt.date.fromisoformat(str(end)[:10]) <= dt.date.today() - dt.timedelta(days=15) and os.path.exists(pth):
+        if end and dt.date.fromisoformat(str(end)[:10]) <= dt.date.today() - dt.timedelta(days=settle) and os.path.exists(pth):
             with open(pth, encoding="utf-8") as fp: d = json.load(fp)
             print(f"  · 캐시 사용 {name}")
             return d["tsv"] if isinstance(d, dict) and set(d) == {"tsv"} else d
@@ -131,6 +132,61 @@ def week_start(d):
     """일요일 시작 주 (아마존 브랜드 분석 주간 기준과 동일)"""
     if isinstance(d, str): d = dt.date.fromisoformat(d[:10])
     return d - dt.timedelta(days=(d.weekday() + 1) % 7)
+
+def day_list(weeks, today=None):
+    """첫 주 일요일 ~ 어제(미국 기준). 매일 수집"""
+    end = (today or dt.date.today()) - dt.timedelta(days=1)
+    return [weeks[0] + dt.timedelta(days=i) for i in range((end - weeks[0]).days + 1)]
+
+def parse_st(st):
+    """Sales & Traffic 리포트 → {asin: {units, sales, sessions, buyBox}}"""
+    m = {}
+    for r in (st.get("salesAndTrafficByAsin", []) if isinstance(st, dict) else []):
+        a = r.get("childAsin") or r.get("parentAsin"); sa, tr = r.get("salesByAsin", {}), r.get("trafficByAsin", {})
+        if not a: continue
+        m[a] = {"units": f(sa.get("unitsOrdered")), "sales": f((sa.get("orderedProductSales") or {}).get("amount")),
+                "sessions": f(tr.get("sessions")), "buyBox": f(tr.get("buyBoxPercentage"))}
+    return m
+
+def weekly_from_daily(weeks, by_day):
+    """날짜별 값 → 주간 합계 (바이박스는 방문 수 가중 평균)"""
+    out = {}
+    for w in weeks:
+        acc = defaultdict(lambda: {"units": 0.0, "sales": 0.0, "sessions": 0.0, "_bb": 0.0})
+        for i in range(7):
+            for a, v in by_day.get((w + dt.timedelta(days=i)).isoformat(), {}).items():
+                x = acc[a]; x["units"] += v["units"]; x["sales"] += v["sales"]; x["sessions"] += v["sessions"]; x["_bb"] += v["buyBox"] * v["sessions"]
+        out[w.isoformat()] = {a: {"units": x["units"], "sales": x["sales"], "sessions": x["sessions"],
+                                  "buyBox": round(x["_bb"] / x["sessions"], 1) if x["sessions"] else 0} for a, x in acc.items()}
+    return out
+
+def prev_daily():
+    """지난 사이트에 저장된 날짜별 판매 (GitHub 캐시가 지워졌을 때 다시 받지 않도록)"""
+    pv = prev_site_data() or {}; out = defaultdict(dict)
+    days = pv.get("days") or []
+    for it in pv.get("asins", []):
+        d = it.get("daily") or {}
+        for i, iso in enumerate(days):
+            try: out[iso][it["asin"]] = {"units": f(d["units"][i]), "sales": f(d["sales"][i]), "sessions": f(d["sessions"][i]), "buyBox": f(d["buyBox"][i])}
+            except (KeyError, IndexError): pass
+    return out
+
+INV_LOG = os.path.join(RAW, "inv_log.json")
+def inv_history(inventory, today_iso):
+    """FBA 재고를 매일 기록 → 재고 추이 차트 (최근 180일 보관)"""
+    log = {}
+    if os.path.exists(INV_LOG):
+        with open(INV_LOG, encoding="utf-8") as fp: log = json.load(fp)
+    else:
+        il = (prev_site_data() or {}).get("invLog") or {}
+        for i, d in enumerate(il.get("days", [])):
+            log[d] = {a: s[i] for a, s in il.get("stock", {}).items() if i < len(s) and s[i] is not None}
+    if inventory: log[today_iso] = {a: int(f(r.get("available"))) for a, r in inventory.items() if a}
+    log = {d: log[d] for d in sorted(log)[-180:]}
+    os.makedirs(RAW, exist_ok=True)
+    with open(INV_LOG, "w", encoding="utf-8") as fp: json.dump(log, fp)
+    days = sorted(log)[-120:]; asins = sorted(set().union(*[set(log[d]) for d in days])) if days else []
+    return {"days": days, "stock": {a: [log[d].get(a) for d in days] for a in asins}}
 
 def week_list(n, today=None):
     last = week_start((today or dt.date.today()) - dt.timedelta(days=7))   # 마지막 '완료된' 주
@@ -189,10 +245,10 @@ class SP:
         self.h = {"x-amz-access-token": lwa_token(env("SPAPI_REFRESH_TOKEN")), "Content-Type": "application/json"}
         self.mp = env("MARKETPLACE_ID", "ATVPDKIKX0DER", False)
 
-    def report(self, report_type, start=None, end=None, options=None, tag=""):
+    def report(self, report_type, start=None, end=None, options=None, tag="", settle=15):
         import requests
         if tag and tag != "now" and end:
-            hit = load_cache(f"sp_{report_type}_{tag}.json", end)
+            hit = load_cache(f"sp_{report_type}_{tag}.json", end, settle)
             if hit is not None: return hit
         body = {"reportType": report_type, "marketplaceIds": [self.mp]}
         if start: body["dataStartTime"] = start
@@ -431,11 +487,11 @@ def fba_fees(sp):
     return out
 
 def catalog_names(sp, asins):
-    """SP-API Catalog Items — 실제 상품명·브랜드 (Product Listing 역할). 30일 캐시"""
+    """SP-API Catalog Items — 실제 상품명·브랜드 (Product Listing 역할). 매일 갱신"""
     out = {}
     for a in asins:
         pth = os.path.join(RAW, f"catalog_{a}.json"); d = None
-        if os.path.exists(pth) and time.time() - os.path.getmtime(pth) < 30 * 86400:
+        if os.path.exists(pth) and time.time() - os.path.getmtime(pth) < 86400:
             with open(pth, encoding="utf-8") as fp: d = json.load(fp)
         else:
             try:
@@ -461,7 +517,7 @@ def review_topics(sp, asins):
     out = {}
     for a in asins:
         pth = os.path.join(RAW, f"cf_topics_{a}.json"); d = None
-        if os.path.exists(pth) and time.time() - os.path.getmtime(pth) < 6 * 86400:   # 아마존이 주 1회 갱신 → 6일 캐시
+        if os.path.exists(pth) and time.time() - os.path.getmtime(pth) < 20 * 3600:   # 매일 갱신 확인 (아마존 원본은 주 1회 바뀜)
             with open(pth, encoding="utf-8") as fp: d = json.load(fp)
         else:
             d = sp.get(f"/customerFeedback/2024-06-01/items/{a}/reviews/topics", {"marketplaceId": sp.mp, "sortBy": "STAR_RATING_IMPACT"})
@@ -699,6 +755,7 @@ def collect(args):
     S, E = weeks[0].isoformat(), (weeks[-1] + dt.timedelta(days=6)).isoformat()
     E28S = (weeks[-1] - dt.timedelta(days=21)).isoformat()
     use_ads = bool(os.getenv("ADS_REFRESH_TOKEN") and os.getenv("ADS_PROFILE_ID"))
+    days = day_list(weeks)
 
     sp_c = sb_c = sd_c = terms = []
     ads_daily, tos = [], {}
@@ -716,9 +773,9 @@ def collect(args):
         for r in tg:   # 키워드별 검색결과 상단 광고 노출 점유율 (가장 높은 값)
             k = str(r.get("keyword") or "").strip().lower()
             if k: tos[k] = max(tos.get(k, 0), round(f(r.get("topOfSearchImpressionShare")) * (100 if f(r.get("topOfSearchImpressionShare")) <= 1 else 1), 1))
-        cur = weeks[0]
-        while cur <= weeks[-1]:
-            end = min(cur + dt.timedelta(days=27), weeks[-1] + dt.timedelta(days=6))
+        cur, last_day = weeks[0], days[-1]
+        while cur <= last_day:   # 상품별 광고비 · 광고 매출: 날짜별 (어제까지)
+            end = min(cur + dt.timedelta(days=27), last_day)
             rows = ads.report(f"SP advertised product {cur}", "SPONSORED_PRODUCTS", "spAdvertisedProduct", ["advertiser"],
                               ["date", "advertisedAsin", "cost", "sales7d"], cur.isoformat(), end.isoformat(), time_unit="DAILY")
             ads_daily += [{"date": r["date"], "asin": r["advertisedAsin"], "cost": r.get("cost"), "sales": r.get("sales7d")} for r in rows]
@@ -728,16 +785,19 @@ def collect(args):
 
     print("[2/3] Selling Partner API")
     sp = SP()
-    sales_by_week, price_fb = {}, {}
-    for w in weeks:   # 상품별 값은 기간 합계로만 나오므로 주마다 요청
-        st = sp.report("GET_SALES_AND_TRAFFIC_REPORT", f"{w}T00:00:00Z", f"{w + dt.timedelta(days=6)}T23:59:59Z",
-                       {"dateGranularity": "WEEK", "asinGranularity": "CHILD"}, tag=w.isoformat())
-        m = {}
-        for r in (st.get("salesAndTrafficByAsin", []) if isinstance(st, dict) else []):
-            a = r.get("childAsin") or r.get("parentAsin"); sa, tr = r.get("salesByAsin", {}), r.get("trafficByAsin", {})
-            m[a] = {"units": f(sa.get("unitsOrdered")), "sales": f((sa.get("orderedProductSales") or {}).get("amount")),
-                    "sessions": f(tr.get("sessions")), "buyBox": f(tr.get("buyBoxPercentage"))}
-        sales_by_week[w.isoformat()] = m
+    price_fb, sales_by_day = {}, {}
+    pv, settle = prev_daily(), 3   # 최근 3일은 아마존이 값을 고치므로 매일 다시 받음
+    for d in days:   # 상품별 값은 기간 합계로만 나오므로 하루씩 요청 (지난 날짜는 캐시 → 매일 새 날짜만)
+        iso = d.isoformat()
+        if iso in pv and d <= dt.date.today() - dt.timedelta(days=settle) and not os.path.exists(os.path.join(RAW, f"sp_GET_SALES_AND_TRAFFIC_REPORT_d{iso}.json")):
+            sales_by_day[iso] = pv[iso]; continue
+        st = sp.report("GET_SALES_AND_TRAFFIC_REPORT", f"{iso}T00:00:00Z", f"{iso}T23:59:59Z",
+                       {"dateGranularity": "DAY", "asinGranularity": "CHILD"}, tag=f"d{iso}", settle=settle)
+        sales_by_day[iso] = parse_st(st)
+    while len(days) > 1 and days[-1] >= dt.date.today() - dt.timedelta(days=3) and not any(v["sessions"] or v["units"] for v in sales_by_day.get(days[-1].isoformat(), {}).values()):
+        days.pop()   # 아직 집계되지 않은 최근 날짜는 0으로 보이지 않게 뺌
+    print(f"  · 날짜별 판매: {days[0]} ~ {days[-1]} ({len(days)}일)")
+    sales_by_week = weekly_from_daily(weeks, sales_by_day)
     # 상품 목록 = 13주 안에 판매가 있었던 모든 상품 + 상품 탭에 저장된 상품 (자동)
     settings = load_products()
     P = settings.get("products", {})
@@ -761,6 +821,7 @@ def collect(args):
     asin_list = [c["asin"] for c in costs]
     inv_raw = sp.report("GET_FBA_INVENTORY_PLANNING_DATA", tag="now")
     inventory = {r.get("asin"): r for r in tsv(inv_raw)} if isinstance(inv_raw, str) else {}
+    inv_log = inv_history(inventory, dt.datetime.now(KST).date().isoformat())
     for a, r in inventory.items(): price_fb[a] = f(r.get("your-price"))
     fees = fba_fees(sp)
     for c in costs:
@@ -821,12 +882,14 @@ def collect(args):
 
     print("[3/3] 환율 · 합치기 · 변환")
     as_of = dt.datetime.now(KST).date()
-    fxd = fx_rates(weeks[0], as_of)
+    fxd = fx_rates(weeks[0], max(as_of, days[-1]))
     fx = fx_pack(fxd, weeks, dt.date.fromisoformat(E28S), dt.date.fromisoformat(E))
     print(f"  · 최신 환율 {fx['latest']:,.2f}원 ({fx['latestDate']}, 기준일 {fx['latestBase']})")
     out = {"meta": {"brand": brand or "우리 브랜드", "marketplace": sp.mp, "currency": "USD", "asOf": as_of.isoformat(),
                     "generatedAt": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "sample": False},
            "fx": fx,
+           "days": [d.isoformat() for d in days],
+           "invLog": inv_log,
            "weeks": [w.isoformat() for w in weeks],
            "asins": build_asins(weeks, sales_by_week, ads_daily, costs, reviews_in, inventory, price_fb, fxd),
            "campaigns": build_campaigns(sp_c, sb_c, sd_c, costs), "searchTerms": build_terms(terms, brand),
@@ -843,6 +906,14 @@ def collect(args):
         if k not in have:
             out["keywords"].append({"keyword": k, "key": v["key"], "volume": 0, "rank": [101] * len(weeks), "spRank": None,
                                     "target": int(f(v["target"])) or None, "noData": True})
+    D_ISO = out["days"]; ad_day = defaultdict(lambda: defaultdict(lambda: [0.0, 0.0]))
+    for r in ads_daily:
+        v = ad_day[r["asin"]][str(r["date"])[:10]]; v[0] += f(r.get("cost")); v[1] += f(r.get("sales"))
+    for it in out["asins"]:   # 날짜별 값 (달러). 화면에서 그날 환율로 원화 환산
+        a = it["asin"]; g = lambda k: [round(f(sales_by_day.get(i, {}).get(a, {}).get(k)), 2) for i in D_ISO]
+        it["daily"] = {"units": [int(x) for x in g("units")], "sales": g("sales"), "sessions": [int(x) for x in g("sessions")], "buyBox": g("buyBox")}
+        if use_ads:
+            it["daily"]["adSpend"] = [round(ad_day[a][i][0], 2) for i in D_ISO]; it["daily"]["adSales"] = [round(ad_day[a][i][1], 2) for i in D_ISO]
     for it in out["asins"]:
         if it["asin"] in themes:
             it["reviewThemes"] = [[t, sh] for t, sh, _ in themes[it["asin"]]]
@@ -888,6 +959,11 @@ def selftest():
     assert fill_fx({"2026-09-27": {"rate": 1359.0, "base": "2026-09-25"}}, dt.date(2026, 9, 27), dt.date(2026, 9, 27))["2026-09-27"]["filled"]
     a2 = build_asins(weeks, sbw, ads_daily, [dict(costs[0], cogsKrw="8800")], [], {}, {}, fill_fx({W[0]: {"rate": 1400.0, "base": W[0]}}, weeks[0], weeks[-1] + dt.timedelta(days=6)))[0]
     assert a2["weeks"]["adSpendKrw"] == [98000] * 4 and a2["cogsKrw"] == 8800
+    wk2 = week_list(1, dt.date(2026, 10, 1)); dl = day_list(wk2, dt.date(2026, 9, 30))
+    assert dl[0] == wk2[0] and dl[-1] == dt.date(2026, 9, 29)
+    bd = {(wk2[0] + dt.timedelta(days=i)).isoformat(): {"A1": {"units": 2, "sales": 50, "sessions": 10 * (i + 1), "buyBox": 100 if i else 50}} for i in range(7)}
+    ww = weekly_from_daily(wk2, bd)[wk2[0].isoformat()]["A1"]
+    assert ww["units"] == 14 and ww["sales"] == 350 and ww["sessions"] == 280 and abs(ww["buyBox"] - 98.2) < 0.1, ww
     print("selftest 통과:", json.dumps({"asin": a["weeks"], "keyword": k, "campaign": c}, ensure_ascii=False)[:400], "…")
 
 if __name__ == "__main__":
