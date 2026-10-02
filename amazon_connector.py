@@ -214,8 +214,15 @@ class Ads:
         self.host = ADS_HOST[env("ADS_REGION", "NA", False)]
         # 광고 API는 SP-API와 별도의 LWA 보안 프로필을 씁니다 (ADS_CLIENT_ID/SECRET). 없으면 LWA_* 사용
         cid = os.getenv("ADS_CLIENT_ID") or env("LWA_CLIENT_ID"); sec = os.getenv("ADS_CLIENT_SECRET") or env("LWA_CLIENT_SECRET")
-        self.h = {"Amazon-Advertising-API-ClientId": cid, "Authorization": f"Bearer {lwa_token(env('ADS_REFRESH_TOKEN'), cid, sec)}",
-                  "Amazon-Advertising-API-Scope": env("ADS_PROFILE_ID"), "Content-Type": "application/vnd.createasyncreportrequest.v3+json"}
+        self._cid, self._sec, self._t, self._h = cid, sec, 0, None
+
+    @property
+    def h(self):   # 토큰 1시간 만료 → 45분마다 갱신 (광고 리포트는 최대 3시간 대기)
+        if self._h is None or time.time() - self._t > 45 * 60:
+            self._h = {"Amazon-Advertising-API-ClientId": self._cid, "Authorization": f"Bearer {lwa_token(env('ADS_REFRESH_TOKEN'), self._cid, self._sec)}",
+                       "Amazon-Advertising-API-Scope": env("ADS_PROFILE_ID"), "Content-Type": "application/vnd.createasyncreportrequest.v3+json"}
+            self._t = time.time()
+        return self._h
 
     def report(self, name, ad_product, report_type, group_by, columns, start, end, time_unit="SUMMARY"):
         import requests
@@ -231,7 +238,9 @@ class Ads:
             r.raise_for_status(); rid = r.json()["reportId"]
         print(f"  · {name} 요청 ({rid}) — 생성에 최대 3시간")
         while True:
-            s = backoff(lambda: requests.get(f"{self.host}/reporting/reports/{rid}", headers=self.h, timeout=60)).json()
+            g = backoff(lambda: requests.get(f"{self.host}/reporting/reports/{rid}", headers=self.h, timeout=60))
+            if g.status_code == 401: self._h = None; continue
+            s = g.json()
             if s["status"] == "COMPLETED":
                 data = json.loads(gzip.decompress(requests.get(s["url"], timeout=120).content))
                 save_raw(f"ads_{report_type}_{start}_{end}.json", data); return data
@@ -242,8 +251,18 @@ class Ads:
 class SP:
     def __init__(self):
         self.host = SP_HOST[env("SPAPI_REGION", "NA", False)]
-        self.h = {"x-amz-access-token": lwa_token(env("SPAPI_REFRESH_TOKEN")), "Content-Type": "application/json"}
+        self._t = 0; self._h = None
         self.mp = env("MARKETPLACE_ID", "ATVPDKIKX0DER", False)
+
+    @property
+    def h(self):
+        # 아마존 접속 토큰은 1시간 뒤 만료 → 45분마다 새로 받음 (첫 실행은 1~2시간 걸리므로 필수)
+        if self._h is None or time.time() - self._t > 45 * 60:
+            self._h = {"x-amz-access-token": lwa_token(env("SPAPI_REFRESH_TOKEN")), "Content-Type": "application/json"}
+            self._t = time.time()
+        return self._h
+
+    def renew(self): self._h = None
 
     def report(self, report_type, start=None, end=None, options=None, tag="", settle=15):
         import requests
@@ -255,15 +274,22 @@ class SP:
         if end: body["dataEndTime"] = end
         if options: body["reportOptions"] = options
         r = backoff(lambda: requests.post(f"{self.host}/reports/2021-06-30/reports", headers=self.h, json=body, timeout=60))
+        if r.status_code in (401, 403):   # 토큰 만료 등 → 새 토큰으로 한 번 더
+            self.renew(); r = backoff(lambda: requests.post(f"{self.host}/reports/2021-06-30/reports", headers=self.h, json=body, timeout=60))
         r.raise_for_status(); rid = r.json()["reportId"]
         print(f"  · {report_type} {tag} 요청 ({rid})")
         while True:
-            s = backoff(lambda: requests.get(f"{self.host}/reports/2021-06-30/reports/{rid}", headers=self.h, timeout=60)).json()
+            g = backoff(lambda: requests.get(f"{self.host}/reports/2021-06-30/reports/{rid}", headers=self.h, timeout=60))
+            if g.status_code in (401, 403): self.renew(); continue
+            s = g.json()
             if s["processingStatus"] == "DONE": break
             if s["processingStatus"] in ("CANCELLED", "FATAL"):
                 raise RuntimeError(f"{report_type} 실패({s['processingStatus']}) — 권한(Role)·기간·브랜드 등록 여부 확인")
             time.sleep(20)
-        d = backoff(lambda: requests.get(f"{self.host}/reports/2021-06-30/documents/{s['reportDocumentId']}", headers=self.h, timeout=60)).json()
+        d = backoff(lambda: requests.get(f"{self.host}/reports/2021-06-30/documents/{s['reportDocumentId']}", headers=self.h, timeout=60))
+        if d.status_code in (401, 403):
+            self.renew(); d = backoff(lambda: requests.get(f"{self.host}/reports/2021-06-30/documents/{s['reportDocumentId']}", headers=self.h, timeout=60))
+        d = d.json()
         raw = requests.get(d["url"], timeout=120).content
         if d.get("compressionAlgorithm") == "GZIP": raw = gzip.decompress(raw)
         txt = raw.decode("utf-8", errors="replace")
@@ -275,6 +301,8 @@ class SP:
     def get(self, path, params=None):
         import requests
         r = backoff(lambda: requests.get(f"{self.host}{path}", headers=self.h, params=params, timeout=60))
+        if r.status_code in (401, 403):
+            self.renew(); r = backoff(lambda: requests.get(f"{self.host}{path}", headers=self.h, params=params, timeout=60))
         if r.status_code in (403, 404): return None
         r.raise_for_status(); return r.json()
 
