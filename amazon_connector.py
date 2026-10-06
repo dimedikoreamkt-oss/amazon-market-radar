@@ -780,7 +780,7 @@ SERP_LOG = os.path.join(RAW, "serp_log.json")
 
 RANK_V = 2   # 순위 조회 방식 버전 (2: 옵션 묶음 인식 + 미국 배송지 기준)
 
-def serp_collect(asins, keywords, today, budget_month=200, extra_reviews=None, family=None):
+def serp_collect(asins, keywords, today, budget_month=200, extra_reviews=None, family=None, comp=None):
     """무료 한도(월 250회) 안에서 매일 자동 배분: 키워드 순위 1~2페이지 + 검색에 안 보인 상품은 상품 페이지로 평점 확인.
        결과는 raw/serp_log.json에 날짜별로 누적 (캐시가 지워져도 사이트의 지난 데이터에서 복원)."""
     log = {"ranks": [], "reviews": []}
@@ -801,10 +801,10 @@ def serp_collect(asins, keywords, today, budget_month=200, extra_reviews=None, f
     if daily <= 0: print(f"  [안내] SerpApi 이번 달 남은 횟수 {left}회 → 오늘은 건너뜀"); return log
     mine = dict(family or {}); mine.update({a: a for a in asins}); seen = {}
     # 키워드: 매일 돌아가며 조회 (하루 daily-상품확인 몫)
-    n_kw = max(1, daily - 1) if keywords else 0
+    n_kw = max(1, daily - 1 - (1 if comp else 0)) if keywords else 0   # 등록한 경쟁 상품이 있으면 하루 1회는 경쟁 상품 확인 몫
     start = (d.toordinal() * n_kw) % max(1, len(keywords)) if keywords else 0
     todays = [keywords[(start + i) % len(keywords)] for i in range(min(n_kw, len(keywords)))]
-    used = 0
+    used = 0; market = log.setdefault("market", [])
     for kw in todays:
         org = spn = found = None; pos_o = 0; pg = 0; top = []
         for page in (1, 2):
@@ -816,6 +816,10 @@ def serp_collect(asins, keywords, today, budget_month=200, extra_reviews=None, f
                 if not sp_:
                     pos_o += 1
                     if len(top) < 3: top.append(a)
+                    if pos_o <= 16 and not mine.get(a):   # 경쟁 상품: 같은 검색 결과에 이미 나온 값(가격·평점·리뷰·월 구매 배지)을 추가 비용 없이 기록
+                        market.append({"date": today, "kw": kw, "pos": pos_o, "asin": a, "title": (it.get("title") or "")[:120],
+                                       "price": it.get("extracted_price"), "rating": it.get("rating"), "reviews": it.get("reviews"),
+                                       "bought": it.get("bought_last_month") or "", "thumb": it.get("thumbnail") or ""})
                 ours = mine.get(a)
                 if ours:
                     if not sp_ and org is None: org, found = pos_o, a
@@ -830,12 +834,170 @@ def serp_collect(asins, keywords, today, budget_month=200, extra_reviews=None, f
         if used >= daily or (d - dt.date.fromisoformat(last)).days < 6: continue
         pr = cli.product(a); used += 1
         if pr.get("rating"): seen[a] = (pr.get("rating"), pr.get("reviews"))
+    # 등록한 경쟁 상품: 최근 7일 검색 결과에 안 보였으면 상품 페이지로 가격·평점·월 구매 배지 확인 (상품마다 주 1회)
+    seen_m = {m["asin"] for m in log.get("market", []) if (d - dt.date.fromisoformat(m["date"])).days < 7}
+    cp = log.setdefault("compPages", [])
+    for a in [x for x in (comp or []) if x not in seen_m and x not in mine]:
+        last = max([r["date"] for r in cp if r["asin"] == a] or ["2000-01-01"])
+        if used >= daily: break
+        if (d - dt.date.fromisoformat(last)).days < 7: continue
+        try: pr = cli.product(a); used += 1
+        except Exception as e: print(f"  [건너뜀] 경쟁 상품 {a}: {e}"); continue
+        cp.append({"date": today, "asin": a, "title": (pr.get("title") or "")[:200], "price": pr.get("extracted_price"), "rating": pr.get("rating"),
+                   "reviews": pr.get("reviews"), "bought": pr.get("bought_last_month") or "", "thumb": ((pr.get("thumbnails") or [""])[0]) or pr.get("thumbnail") or ""})
+    log["compPages"] = [r for r in cp if (d - dt.date.fromisoformat(r["date"])).days <= 120][-600:]
     for a, (v, n) in seen.items(): log["reviews"].append({"asin": a, "date": today, "rating": v, "reviews": n})
     log["ranks"] = log["ranks"][-3000:]; log["reviews"] = log["reviews"][-3000:]
+    cut = (d - dt.timedelta(days=28)).isoformat(); log["market"] = [m for m in log.get("market", []) if m["date"] >= cut][-2000:]
     os.makedirs(RAW, exist_ok=True)
     with open(SERP_LOG, "w", encoding="utf-8") as fp: json.dump(log, fp, ensure_ascii=False)
     print(f"  · SerpApi {used}회 사용 (남은 {left - used}회): 순위 {len(todays)}개 키워드 · 평점 {len(seen)}개 상품")
     return log
+
+# ---------------------------------------------------------------- 경쟁사 (가격 · 판매량 추정 · 리뷰)
+BSR_LOG = os.path.join(RAW, "bsr_log.json")
+BSR_SLOPE = 1.0   # 같은 카테고리 우리 상품이 2개 미만일 때 쓰는 기본 기울기 (순위 2배 = 판매 1/2)
+
+def bought_min(txt):
+    """'1K+ bought in past month' → 1000 (아마존이 판매 페이지·검색 결과에 보여 주는 지난달 구매 수 하한)"""
+    import re
+    m = re.search(r"([\d.,]+)\s*([KkMm]?)\+?\s*bought", str(txt or ""))
+    if not m: return 0
+    v = float(m.group(1).replace(",", "")); u = m.group(2).upper()
+    return int(v * (1000 if u == "K" else 1_000_000 if u == "M" else 1))
+
+def bsr_main(d):
+    """Catalog salesRanks → (대분류 순위, 대분류 이름, 세부 분류 순위, 세부 분류 이름)"""
+    g = ((d or {}).get("salesRanks") or [{}])[0]
+    dg = (g.get("displayGroupRanks") or [{}])[0]; cr = (g.get("classificationRanks") or [{}])[0]
+    return dg.get("rank"), dg.get("title", ""), cr.get("rank"), cr.get("title", "")
+
+def item_offers(sp, asins):
+    """Product Pricing API getItemOffersBatch (공식, 무료, 'Pricing' 역할) — 경쟁 상품의 현재 판매가(바이박스)·판매자 수·판매 순위. 20개씩, 10초 간격"""
+    import requests
+    out, denied = {}, False
+    for i in range(0, len(asins), 20):
+        body = {"requests": [{"uri": f"/products/pricing/v0/items/{a}/offers", "method": "GET", "MarketplaceId": sp.mp, "ItemCondition": "New", "CustomerType": "Consumer"} for a in asins[i:i + 20]]}
+        r = backoff(lambda: requests.post(f"{sp.host}/batches/products/pricing/v0/itemOffers", headers=sp.h, json=body, timeout=60))
+        if r.status_code in (401, 403): denied = True; break
+        if not r.ok: print(f"  [건너뜀] 경쟁 가격: {r.status_code}"); break
+        for x in r.json().get("responses") or []:
+            pl = ((x.get("body") or {}).get("payload")) or {}; sm = pl.get("Summary") or {}
+            a = pl.get("ASIN") or ((x.get("request") or {}).get("Asin"))
+            if not a: continue
+            bb = [b for b in sm.get("BuyBoxPrices") or [] if (b.get("condition") or "").lower() == "new"]
+            lo = [b for b in sm.get("LowestPrices") or [] if (b.get("condition") or "").lower() == "new"]
+            pick_ = (bb or lo or [{}])[0]
+            price = f(((pick_.get("LandedPrice") or {}).get("Amount")) or ((pick_.get("ListingPrice") or {}).get("Amount"))) or None
+            out[a] = {"price": price, "offers": sm.get("TotalOfferCount"), "ranks": [{"cat": r_.get("ProductCategoryId"), "rank": r_.get("Rank")} for r_ in sm.get("SalesRankings") or []][:3]}
+        if i + 20 < len(asins): time.sleep(10)
+    if denied: print("  [안내] 경쟁 가격(Product Pricing API): 권한 없음 → 앱에 'Pricing' 역할을 체크하고 다시 승인하면 공식 가격도 받습니다 (지금은 검색 결과 가격 사용)")
+    elif out: print(f"  · 경쟁 가격 (Product Pricing API): {len(out)}개 상품")
+    return out, not denied
+
+def bsr_fit(points):
+    """우리 상품의 (판매 순위, 실제 30일 판매량)으로 '순위 → 판매량' 곡선을 맞춤: 판매량 = A × 순위^(-b)"""
+    import math
+    pts = [(math.log(r), math.log(u)) for r, u in points if r and u and r > 0 and u > 0]
+    if not pts: return None
+    b = BSR_SLOPE
+    if len(pts) >= 3 and max(p[0] for p in pts) - min(p[0] for p in pts) > math.log(3):
+        mx = sum(p[0] for p in pts) / len(pts); my = sum(p[1] for p in pts) / len(pts)
+        sxx = sum((p[0] - mx) ** 2 for p in pts); sxy = sum((p[0] - mx) * (p[1] - my) for p in pts)
+        if sxx > 0: b = min(1.6, max(0.5, -sxy / sxx))
+    lnA = sum(p[1] + b * p[0] for p in pts) / len(pts)
+    return {"lnA": lnA, "b": round(b, 3), "n": len(pts), "fit": len(pts) >= 3 and b != BSR_SLOPE}
+
+def competitors(sp, settings, asin_list, family, sales_by_day, auto_log, today, prev=None):
+    """경쟁 상품: ① 상품 설정에서 등록한 ASIN ② 우리 키워드 검색 결과에 자주 나온 상품(자동 후보).
+       가격 = 공식 Pricing API(가능하면) → 검색 결과 가격. 리뷰·평점·월 구매 배지 = 검색 결과·상품 페이지(SerpApi).
+       판매량 = 아마존 '지난달 구매' 배지(하한) + 판매 순위(BSR)를 우리 상품 실제 판매량으로 맞춘 추정"""
+    mine = set(family or {}) | set(asin_list)
+    reg = [c for c in (settings.get("competitors") or []) if c.get("asin") and c["asin"] not in mine]
+    d0 = dt.date.fromisoformat(today)
+    market = [m for m in (auto_log or {}).get("market", []) if (d0 - dt.date.fromisoformat(m["date"])).days < 28]
+    pages = (auto_log or {}).get("compPages", [])
+    obs = defaultdict(list)
+    for m in market + [dict(p, kw="", pos=None) for p in pages]: obs[m["asin"]].append(m)
+    seen_kw = defaultdict(dict)
+    for m in market:
+        if m.get("kw"): seen_kw[m["asin"]][m["kw"]] = min(m["pos"], seen_kw[m["asin"]].get(m["kw"], 999))
+    cand = sorted((a for a in seen_kw if a not in mine), key=lambda a: (-len(seen_kw[a]), min(seen_kw[a].values())))[:int(os.getenv("COMP_AUTO", "15"))]
+    reg_a = [c["asin"] for c in reg]
+    track = list(dict.fromkeys(reg_a + cand))[:40]
+    # 카탈로그 (판매 순위·브랜드·이미지) — 무료, 하루 1회
+    cat = {}
+    for a in track:
+        pth = os.path.join(RAW, f"catalog_comp_{a}.json"); dd = None
+        if os.path.exists(pth) and time.time() - os.path.getmtime(pth) < 20 * 3600:
+            with open(pth, encoding="utf-8") as fp: dd = json.load(fp)
+        else:
+            try:
+                dd = sp.get(f"/catalog/2022-04-01/items/{a}", {"marketplaceIds": sp.mp, "includedData": "summaries,images,salesRanks"})
+                if dd: save_raw(f"catalog_comp_{a}.json", dd)
+            except Exception as e: print(f"  [건너뜀] 경쟁 상품 정보 {a}: {e}")
+        if dd: cat[a] = dd
+    offers, pricing_ok = ({}, False)
+    try: offers, pricing_ok = item_offers(sp, reg_a + [a for a in cand[:10] if a not in reg_a])
+    except Exception as e: print(f"  [건너뜀] 경쟁 가격: {e}")
+    # 판매 순위 기록 (우리 + 경쟁) — 날짜별 누적, 캐시가 지워지면 지난 사이트에서 복원
+    log = {}
+    if os.path.exists(BSR_LOG):
+        with open(BSR_LOG, encoding="utf-8") as fp: log = json.load(fp)
+    elif (prev or {}).get("competitors", {}).get("bsrLog"): log = prev["competitors"]["bsrLog"]
+    for a, dd in list(cat.items()) + [(a, CATALOG.get(a)) for a in asin_list]:
+        r, g, cr, ct = bsr_main(dd)
+        if r:
+            h = [x for x in log.get(a, []) if x[0] != today]; h.append([today, int(r), g, int(cr or 0), ct]); log[a] = h[-120:]
+    os.makedirs(RAW, exist_ok=True)
+    with open(BSR_LOG, "w", encoding="utf-8") as fp: json.dump(log, fp, ensure_ascii=False)
+    # 곡선 맞추기: 우리 상품 (최근 30일 평균 순위, 실제 30일 판매량), 대분류별
+    days30 = sorted(sales_by_day)[-30:]
+    pts = defaultdict(list)
+    for a in asin_list:
+        h = [x for x in log.get(a, []) if x[0] >= (d0 - dt.timedelta(days=30)).isoformat()]
+        u = sum(int(f(sales_by_day[x].get(a, {}).get("units"))) for x in days30)
+        if h and u > 0: pts[h[-1][2]].append((sum(x[1] for x in h) / len(h), u * 30 / max(1, len(days30))))
+    curves = {g: bsr_fit(p) for g, p in pts.items()}
+    allp = [x for p in pts.values() for x in p]
+    import math
+    def est(a):
+        h = [x for x in log.get(a, []) if x[0] >= (d0 - dt.timedelta(days=30)).isoformat()]
+        if not h: return None, None
+        rk = sum(x[1] for x in h) / len(h); cv = curves.get(h[-1][2])
+        basis = "same" if cv else None
+        if not cv and allp: cv = bsr_fit(allp); basis = "other"
+        if not cv: return None, None
+        return int(round(math.exp(cv["lnA"] - cv["b"] * math.log(rk)))), basis
+    vs_of = {c["asin"]: c.get("vs") or "" for c in reg}
+    items = []
+    for a in track:
+        o = sorted(obs.get(a, []), key=lambda m: m["date"]); last = o[-1] if o else {}
+        sm = ((cat.get(a) or {}).get("summaries") or [{}])[0]
+        img = next((im.get("link") for g in (cat.get(a) or {}).get("images") or [] for im in g.get("images") or [] if im.get("variant") == "MAIN"), "") or last.get("thumb", "")
+        r, g, cr, ct = bsr_main(cat.get(a))
+        e, basis = est(a)
+        price = (offers.get(a) or {}).get("price") or last.get("price")
+        ph = defaultdict(list)
+        for m in o:
+            if m.get("price"): ph[m["date"]].append(m["price"])
+        rv = [(m["date"], m.get("rating"), m.get("reviews")) for m in o if m.get("reviews")]
+        bt = next((m["bought"] for m in reversed(o) if m.get("bought")), "")
+        vs = vs_of.get(a) or ""
+        items.append({"asin": a, "tracked": a in reg_a, "vs": vs, "title": sm.get("itemName") or last.get("title", ""), "brand": sm.get("brandName", ""), "image": img,
+                      "price": price, "priceSrc": "api" if (offers.get(a) or {}).get("price") else ("search" if last.get("price") else ""),
+                      "offers": (offers.get(a) or {}).get("offers"),
+                      "priceHist": [[k, round(sum(v) / len(v), 2)] for k, v in sorted(ph.items())][-60:],
+                      "rating": rv[-1][1] if rv else None, "reviews": rv[-1][2] if rv else None, "reviewsHist": [[x[0], x[2]] for x in rv][-60:],
+                      "bought": bt, "boughtMin": bought_min(bt), "bsr": r, "bsrCat": g, "subRank": cr, "subCat": ct,
+                      "bsrHist": [[x[0], x[1]] for x in log.get(a, [])][-90:], "estUnits30": e, "estBasis": basis,
+                      "kw": sorted([{"kw": k, "pos": v} for k, v in seen_kw.get(a, {}).items()], key=lambda x: x["pos"])[:8], "seen": last.get("date", "")})
+    ours = {a: {"bsr": (log.get(a) or [[None, None, "", 0, ""]])[-1][1], "bsrCat": (log.get(a) or [[None, None, "", 0, ""]])[-1][2],
+                "subRank": (log.get(a) or [[None, None, "", 0, ""]])[-1][3], "subCat": (log.get(a) or [[None, None, "", 0, ""]])[-1][4],
+                "bsrHist": [[x[0], x[1]] for x in log.get(a, [])][-90:]} for a in asin_list}
+    print(f"  · 경쟁 상품 {len(items)}개 (등록 {len(reg_a)} · 검색 결과 자동 {len([i for i in items if not i['tracked']])}) · 판매량 곡선 {', '.join(g + ': ' + str(c['n']) + '개 상품' for g, c in curves.items() if c) or '아직 없음'}")
+    return {"items": items, "ours": ours, "pricingApi": pricing_ok, "updated": today,
+            "curves": {g: dict(c, lnA=round(c["lnA"], 4)) for g, c in curves.items() if c}, "bsrLog": log}
 
 SOL_LOG = os.path.join(RAW, "solicit_log.json")
 
@@ -1221,7 +1383,8 @@ def collect(args):
     auto_log = {"ranks": [], "reviews": []}
     if os.getenv("SERPAPI_KEY"):
         restore_serp_log()
-        try: auto_log = serp_collect(asin_list, kw_track, dt.date.today().isoformat(), extra_reviews=page_reviews, family=family)
+        try: auto_log = serp_collect(asin_list, kw_track, dt.date.today().isoformat(), extra_reviews=page_reviews, family=family,
+                                     comp=[c["asin"] for c in settings.get("competitors") or [] if c.get("asin")])
         except Exception as e: print(f"  [건너뜀] 순위·평점 자동 조회: {e}")
     real = ranks_in + auto_log["ranks"]
     mw = {(r["keyword"].strip().lower(), min(week_start(r["date"]).isoformat(), weeks[-1].isoformat())) for r in real}
@@ -1232,6 +1395,8 @@ def collect(args):
     ranks_in = [dict(r, **{k: v for k, v in meta_by.get(r["keyword"].strip().lower(), {}).items() if k in ("key", "target") and v}) for r in ranks_in]
     reviews_in = [r for r in reviews_in if r.get("rating")]
 
+    try: comp_out = competitors(sp, settings, asin_list, family, sales_by_day, auto_log, dt.date.today().isoformat(), prev_site_data())
+    except Exception as e: comp_out = {"items": [], "error": str(e)[:160]}; print(f"  [건너뜀] 경쟁사: {e}")
     try: sol_log, sol_state = review_requests(sp, dt.datetime.now(KST).date().isoformat(), settings.get("reviewRequest") or {},
                                               ((prev_site_data() or {}).get("reviewOps") or {}).get("orders"))
     except Exception as e: sol_log, sol_state = {}, {"enabled": False, "error": str(e)[:120]}; print(f"  [건너뜀] 리뷰 요청: {e}")
@@ -1252,6 +1417,7 @@ def collect(args):
            "autoLog": auto_log,
            "reviewOps": dict(sol_state, orders=sol_log),
            "listing": listing,
+           "competitors": comp_out,
            "productSettings": settings,
            "allProducts": [{"asin": a, "excluded": a in excluded, "sales13w": round(tot.get(a, 0)),
                             "name": (names.get(a) or {}).get("name") or (fees.get(a) or {}).get("name") or inventory.get(a, {}).get("product-name", ""),
@@ -1323,6 +1489,10 @@ def selftest():
     bd = {(wk2[0] + dt.timedelta(days=i)).isoformat(): {"A1": {"units": 2, "sales": 50, "sessions": 10 * (i + 1), "buyBox": 100 if i else 50}} for i in range(7)}
     ww = weekly_from_daily(wk2, bd)[wk2[0].isoformat()]["A1"]
     assert ww["units"] == 14 and ww["sales"] == 350 and ww["sessions"] == 280 and abs(ww["buyBox"] - 98.2) < 0.1, ww
+    assert bought_min("1K+ bought in past month") == 1000 and bought_min("50+ bought in past month") == 50 and bought_min("") == 0
+    cv = bsr_fit([(100, 3000), (1000, 300), (10000, 30)])
+    assert cv["fit"] and abs(cv["b"] - 1.0) < 1e-6
+    assert bsr_fit([(500, 600)])["b"] == BSR_SLOPE
     print("selftest 통과:", json.dumps({"asin": a["weeks"], "keyword": k, "campaign": c}, ensure_ascii=False)[:400], "…")
 
 if __name__ == "__main__":
