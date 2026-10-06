@@ -348,7 +348,7 @@ def build_asins(weeks, sales_by_week, ads_daily, costs, reviews, inventory, pric
         rt = [x if x is not None else first[0] for x in rt]; rc = [int(y) if y is not None else int(first[1]) for y in rc]
         tot_u, tot_s = sum(units[-4:]), sum(sales[-4:])
         price = round(tot_s / tot_u, 2) if tot_u else price_fallback.get(a, 0)
-        item = {"asin": a, "name": c.get("name") or inv.get("product-name", a)[:40], "short": c.get("short") or a, "key": c["key"],
+        item = {"asin": a, "name": c.get("name") or inv.get("product-name", a), "variant": c.get("variant", ""), "short": c.get("short") or a, "key": c["key"],
                 "price": price, "cogs": f(c.get("cogs")), "fbaFee": f(c.get("fbaFee")) or f(inv.get("estimated-fee-total")) or 0,
                 "leadtime": int(f(c.get("leadtime")) or 45), "safety": int(f(c.get("safety")) or 14),
                 "fbaStock": int(f(inv.get("available"))), "inbound": int(f(c.get("inbound")) or f(inv.get("inbound-quantity"))),
@@ -370,14 +370,19 @@ def build_keywords(weeks, ranks, sqp, brand, tos=None):
     by = defaultdict(lambda: defaultdict(list)); meta = {}
     for r in ranks:
         wk_ = min(week_start(r["date"]).isoformat(), W[-1])   # 진행 중인 이번 주 값은 마지막 주로
-        k = r["keyword"].strip().lower(); by[k][wk_].append(f(r["rank"]) or 101)
+        k = r["keyword"].strip().lower(); real_ = r.get("src") != "est"
         m = meta.setdefault(k, {}); m.update({x: r[x] for x in ("key", "volume", "target", "spRank") if r.get(x)})
-        m.setdefault("src", {})[wk_] = "est" if r.get("src") == "est" and m.get("src", {}).get(wk_) != "real" else "real"
+        if real_ or m.get("src", {}).get(wk_) != "real":
+            if real_ and m.get("src", {}).get(wk_) != "real": by[k][wk_] = []   # 실측이 있으면 추정값은 버림
+            by[k][wk_].append((str(r["date"]), f(r["rank"]) or 101))
+            m.setdefault("src", {})[wk_] = "real" if real_ else "est"
+        if real_ and str(r["date"]) >= m.get("checked", ""):
+            m["checked"] = str(r["date"]); m["found"] = r.get("found", ""); m["pages"] = r.get("pages", 0)
     out = []
     for k, wk in by.items():
         ser, last = [], None
         for w in W:
-            if wk.get(w): last = round(sum(wk[w]) / len(wk[w]))
+            if wk.get(w): last = round(max(wk[w])[1])   # 그 주 가장 최근 측정값
             ser.append(last)
         fv = next((x for x in ser if x is not None), 101); ser = [x if x is not None else fv for x in ser]
         q = sqp.get(k, {}); m = meta.get(k, {})
@@ -387,6 +392,11 @@ def build_keywords(weeks, ranks, sqp, brand, tos=None):
         if q: item["sqp"] = {"impr": round(q["impr"], 2), "click": round(q["click"], 2), "purchase": round(q["purchase"], 2)}
         lastw = max(m.get("src", {}) or {"": ""})
         if m.get("src", {}).get(lastw) == "est": item["est"] = True
+        sw, lastsrc = [], None
+        for w in W:
+            lastsrc = m.get("src", {}).get(w, lastsrc); sw.append("e" if lastsrc == "est" else "r" if lastsrc == "real" else "")
+        item["rankSrc"] = sw
+        if m.get("checked"): item.update({"checked": m["checked"], "found": m.get("found", ""), "pages": m.get("pages", 0)})
         if tos and k in tos: item["tos"] = tos[k]
         out.append(item)
     return out
@@ -408,11 +418,15 @@ def parse_sqp(doc):
         if not q: continue
         a = agg[q.lower()]; a["_n"] += 1
         a["volume"] = max(a["volume"], int(f(pick(r, "searchQueryData.searchQueryVolume", "searchQueryVolume"))))
-        for k, paths in (("impr", ("impressionData.asinImpressionShare", "impressionData.brandImpressionShare")),
-                         ("click", ("clickData.asinClickShare", "clickData.brandClickShare")),
-                         ("purchase", ("purchaseData.asinPurchaseShare", "purchaseData.brandPurchaseShare"))):
-            v = f(pick(r, *paths)); v = v * 100 if v <= 1 else v; a[k] += v   # 0~1 또는 % 모두 대응
+        for k, paths, cnt in (("impr", ("impressionData.asinImpressionShare", "impressionData.brandImpressionShare"), ("impressionData.asinImpressionCount", "impressionData.totalQueryImpressionCount")),
+                              ("click", ("clickData.asinClickShare", "clickData.brandClickShare"), ("clickData.asinClickCount", "clickData.totalClickCount")),
+                              ("purchase", ("purchaseData.asinPurchaseShare", "purchaseData.brandPurchaseShare"), ("purchaseData.asinPurchaseCount", "purchaseData.totalPurchaseCount"))):
+            n_, tot_ = f(pick(r, cnt[0])), f(pick(r, cnt[1]))
+            if tot_ > 0: v = 100 * n_ / tot_   # 점유율은 개수로 직접 계산 (점유율 칸의 단위가 0~1/0~100으로 헷갈리는 문제 방지)
+            else: v = f(pick(r, *paths)); v = v * 100 if v <= 1 else v
+            a[k] += v
             if k == "click":
+                a["clickTop"] = max(a.get("clickTop", 0.0), v)   # 순위 추정은 가장 잘 보인 상품 1개 기준
                 asn = pick(r, "asin", "searchQueryData.asin")
                 if asn and v >= a.get("_top", -1): a["_top"], a["asin"] = v, asn
     for a in agg.values(): a.pop("_n"); a.pop("_top", None)
@@ -520,20 +534,58 @@ def catalog_names(sp, asins):
     """SP-API Catalog Items — 실제 상품명·브랜드 (Product Listing 역할). 매일 갱신"""
     out = {}
     for a in asins:
-        pth = os.path.join(RAW, f"catalog2_{a}.json"); d = None
+        pth = os.path.join(RAW, f"catalog3_{a}.json"); d = None
         if os.path.exists(pth) and time.time() - os.path.getmtime(pth) < 20 * 3600:
             with open(pth, encoding="utf-8") as fp: d = json.load(fp)
         else:
             try:
-                d = sp.get(f"/catalog/2022-04-01/items/{a}", {"marketplaceIds": sp.mp, "includedData": "summaries,images,attributes,salesRanks"})
-                if d: save_raw(f"catalog2_{a}.json", d)
+                d = sp.get(f"/catalog/2022-04-01/items/{a}", {"marketplaceIds": sp.mp, "includedData": "summaries,images,attributes,salesRanks,relationships"})
+                if d: save_raw(f"catalog3_{a}.json", d)
             except Exception as e:
                 print(f"  [건너뜀] 상품명 {a}: {e}")
         if d: CATALOG[a] = d
         sm = ((d or {}).get("summaries") or [{}])[0]
-        if sm.get("itemName"): out[a] = {"name": sm["itemName"], "brand": sm.get("brandName", "")}
+        if sm.get("itemName"): out[a] = {"name": sm["itemName"], "brand": sm.get("brandName", ""), "variant": variant_of(d)}
     print(f"  · 상품명 (Catalog Items API): {len(out)}/{len(asins)}개")
     return out
+
+def variant_of(d):
+    """Catalog summaries → 옵션 표시 (색상 · 사이즈 · 스타일 · 묶음 수)"""
+    sm = ((d or {}).get("summaries") or [{}])[0]; at = (d or {}).get("attributes") or {}
+    def av(k):
+        v = (at.get(k) or [{}])[0]
+        return str(v.get("value") or "").strip() if isinstance(v, dict) else ""
+    parts = [sm.get("color") or av("color"), sm.get("size") or av("size"), sm.get("style") or av("style")]
+    pq = sm.get("packageQuantity") or av("number_of_items")
+    if pq and str(pq) not in ("0", "1"): parts.append(f"{pq}개입")
+    return " · ".join(dict.fromkeys(p for p in parts if p))
+
+def variation_family(sp, asins):
+    """같은 상품의 다른 옵션(색상·사이즈) ASIN → 우리 상품 ASIN.
+       아마존 검색 결과에는 옵션 묶음 중 한 ASIN만 보이므로, 이걸 모르면 실제로 상위에 있어도 '순위 밖'으로 잡힘"""
+    fam = {a: a for a in asins}
+    for a in asins:
+        rel = []
+        for r in (CATALOG.get(a) or {}).get("relationships") or []:
+            rel += r.get("relationships") or []
+        parents = [p for x in rel for p in x.get("parentAsins") or []]
+        for x in rel:
+            for c in x.get("childAsins") or []: fam.setdefault(c, a)
+        for p in parents:
+            fam.setdefault(p, a)
+            pth = os.path.join(RAW, f"catalog_parent_{p}.json"); d = None
+            if os.path.exists(pth) and time.time() - os.path.getmtime(pth) < 6 * 86400:
+                with open(pth, encoding="utf-8") as fp: d = json.load(fp)
+            else:
+                try:
+                    d = sp.get(f"/catalog/2022-04-01/items/{p}", {"marketplaceIds": sp.mp, "includedData": "relationships"})
+                    if d: save_raw(f"catalog_parent_{p}.json", d)
+                except Exception as e: print(f"  [건너뜀] 옵션 묶음 {p}: {e}")
+            for r in (d or {}).get("relationships") or []:
+                for x in r.get("relationships") or []:
+                    for c in x.get("childAsins") or []: fam.setdefault(c, a)
+    print(f"  · 옵션 묶음: 우리 상품 {len(asins)}개 → 검색에서 알아볼 ASIN {len(fam)}개")
+    return fam
 
 def short_name(title, brand=""):
     """긴 아마존 상품명 → 화면용 짧은 이름 (브랜드 제거, 첫 구절, 최대 28자)"""
@@ -581,7 +633,8 @@ class Serp:
         except Exception: return 0
     def search(self, kw, page=1):
         import requests
-        r = backoff(lambda: requests.get(self.URL, params={"engine": "amazon", "k": kw, "amazon_domain": "amazon.com", "page": page, "api_key": self.key}, timeout=90))
+        r = backoff(lambda: requests.get(self.URL, params={"engine": "amazon", "k": kw, "amazon_domain": "amazon.com", "page": page, "language": "en_US", "device": "desktop",
+                                                                      "delivery_zip": env("RANK_ZIP", "10001", False), "api_key": self.key}, timeout=90))
         r.raise_for_status(); return r.json()
     def product(self, asin):
         import requests
@@ -724,12 +777,18 @@ def build_listing(asins, serp, aplus_sp):
 
 SERP_LOG = os.path.join(RAW, "serp_log.json")
 
-def serp_collect(asins, keywords, today, budget_month=200, extra_reviews=None):
+RANK_V = 2   # 순위 조회 방식 버전 (2: 옵션 묶음 인식 + 미국 배송지 기준)
+
+def serp_collect(asins, keywords, today, budget_month=200, extra_reviews=None, family=None):
     """무료 한도(월 250회) 안에서 매일 자동 배분: 키워드 순위 1~2페이지 + 검색에 안 보인 상품은 상품 페이지로 평점 확인.
        결과는 raw/serp_log.json에 날짜별로 누적 (캐시가 지워져도 사이트의 지난 데이터에서 복원)."""
     log = {"ranks": [], "reviews": []}
     if os.path.exists(SERP_LOG):
         with open(SERP_LOG, encoding="utf-8") as fp: log = json.load(fp)
+    old = [r for r in log["ranks"] if r.get("v") != RANK_V]
+    if old:   # 예전 방식(옵션 묶음 미인식)으로 잰 순위는 버림 → 그 주는 SQP 추정으로 대체
+        log["ranks"] = [r for r in log["ranks"] if r.get("v") == RANK_V]
+        print(f"  · 예전 방식 순위 기록 {len(old)}개 정리 (옵션 묶음 미인식으로 '순위 밖' 오판 가능)")
     if any(r["date"] == today for r in log["ranks"]) or any(r["date"] == today for r in log["reviews"]):
         print("  · 오늘 순위·평점은 이미 조회함 (재실행 시 무료 한도 절약)"); return log
     for r in extra_reviews or []:   # 판매 페이지에서 오늘 받은 평점은 그대로 기록 (추가 호출 없음)
@@ -739,26 +798,31 @@ def serp_collect(asins, keywords, today, budget_month=200, extra_reviews=None):
     d = dt.date.fromisoformat(today); days_left = calendar.monthrange(d.year, d.month)[1] - d.day + 1
     daily = max(0, min(budget_month // 30, (left - 5) // max(1, days_left)))   # 월 250회를 넘지 않게 하루 몫 배분
     if daily <= 0: print(f"  [안내] SerpApi 이번 달 남은 횟수 {left}회 → 오늘은 건너뜀"); return log
-    mine = set(asins); seen = {}
+    mine = dict(family or {}); mine.update({a: a for a in asins}); seen = {}
     # 키워드: 매일 돌아가며 조회 (하루 daily-상품확인 몫)
     n_kw = max(1, daily - 1) if keywords else 0
     start = (d.toordinal() * n_kw) % max(1, len(keywords)) if keywords else 0
     todays = [keywords[(start + i) % len(keywords)] for i in range(min(n_kw, len(keywords)))]
     used = 0
     for kw in todays:
-        org = spn = None; pos_o = 0
+        org = spn = found = None; pos_o = 0; pg = 0; top = []
         for page in (1, 2):
             if used >= daily: break
-            res = cli.search(kw, page); used += 1
+            res = cli.search(kw, page); used += 1; pg = page
             for it in res.get("organic_results") or []:
                 a = it.get("asin"); sp_ = bool(it.get("sponsored"))
-                if not sp_: pos_o += 1
-                if a in mine:
-                    if not sp_ and org is None: org = pos_o
+                if not a: continue   # 상품이 아닌 칸(안내·묶음 배너)은 순위에 넣지 않음
+                if not sp_:
+                    pos_o += 1
+                    if len(top) < 3: top.append(a)
+                ours = mine.get(a)
+                if ours:
+                    if not sp_ and org is None: org, found = pos_o, a
                     if sp_ and spn is None: spn = it.get("position")
-                    if it.get("rating"): seen[a] = (it.get("rating"), it.get("reviews"))
+                    if it.get("rating"): seen[ours] = (it.get("rating"), it.get("reviews"))
             if org is not None: break
-        log["ranks"].append({"keyword": kw, "date": today, "rank": org or 101, "spRank": spn or ""})
+        log["ranks"].append({"keyword": kw, "date": today, "rank": org or 101, "spRank": spn or "", "v": RANK_V,
+                             "found": found or "", "foundFor": mine.get(found, "") if found else "", "pages": pg, "top3": top})
     # 검색에 안 보인 상품은 상품 페이지로 평점 확인 (남은 몫, 상품마다 주 1회 이상)
     for a in [x for x in asins if x not in seen]:
         last = max([r["date"] for r in log["reviews"] if r["asin"] == a] or ["2000-01-01"])
@@ -812,7 +876,7 @@ def merge_sqp(parts):
             x = m.setdefault(q, {"volume": 0, "impr": 0.0, "click": 0.0, "purchase": 0.0})
             x["volume"] = max(x["volume"], v["volume"])
             for k in ("impr", "click", "purchase"): x[k] += v[k]
-            if v.get("asin"): x.setdefault("asin", v["asin"])
+            if v.get("clickTop", 0) >= x.get("clickTop", -1): x["clickTop"] = v.get("clickTop", 0); x["asin"] = v.get("asin") or x.get("asin")
     return m
 
 def keywords_from_sqp(weeks, sqp_w, brand, chosen, n, costs=()):
@@ -826,7 +890,7 @@ def keywords_from_sqp(weeks, sqp_w, brand, chosen, n, costs=()):
             q = (sqp_w.get(w) or {}).get(k)
             if q:
                 key = next((c["key"] for c in costs if c["asin"] == q.get("asin")), "")
-                rows.append({"keyword": k, "date": w, "rank": est_rank(q["click"]), "volume": q["volume"], "src": "est", **({"key": key} if key else {})})
+                rows.append({"keyword": k, "date": w, "rank": est_rank(q.get("clickTop", q["click"])), "volume": q["volume"], "src": "est", **({"key": key} if key else {})})
     return rows
 
 # ---------------------------------------------------------------- 수집
@@ -1011,7 +1075,7 @@ def collect(args):
                 parts = []
                 for ch in asin_chunks(asin_list):
                     doc = sp.report("GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT", f"{w}T00:00:00Z", f"{w + dt.timedelta(days=6)}T23:59:59Z",
-                                    {"reportPeriod": "WEEK", "asin": ch}, tag=f"{w.isoformat()}_{abs(hash(ch)) % 10**6}")
+                                    {"reportPeriod": "WEEK", "asin": ch}, tag=f"{w.isoformat()}_{int(__import__('hashlib').md5(ch.encode()).hexdigest(), 16) % 10**6}")   # 실행마다 같은 이름 → 캐시 적중
                     parts.append(parse_sqp(doc))
                 sqp_w[w.isoformat()] = merge_sqp(parts)
             sqp = sqp_w.get(weeks[-1].isoformat(), {})
@@ -1027,8 +1091,15 @@ def collect(args):
     for c in costs:   # 원가표에 이름이 없으면 실제 아마존 상품명 사용
         nm = names.get(c["asin"])
         if nm:
-            if not c.get("name"): c["name"] = nm["name"][:80]
+            if not c.get("name"): c["name"] = nm["name"]   # 전체 상품명 (화면에서 줄바꿈)
+            if nm.get("variant"): c["variant"] = nm["variant"]
             if not c.get("short") or c["short"] == c["asin"][-5:]: c["short"] = short_name(nm["name"], nm["brand"] or brand)
+    dup = defaultdict(int)
+    for c in costs: dup[c.get("short", "")] += 1
+    for c in costs:   # 같은 짧은 이름이 여러 개면 옵션을 붙여 구분
+        if dup[c.get("short", "")] > 1 and c.get("variant") and not P.get(c["asin"], {}).get("short"):
+            c["short"] = f'{c["short"].rstrip("…")} · {c["variant"].split(" · ")[0][:14]}'
+    family = variation_family(sp, asin_list)
     # 상품 현황 (판매 페이지): 공식 A+ 문구 + SerpApi A+ 이미지·영상·상위 리뷰
     aplus_sp = {}
     for a in asin_list:
@@ -1056,7 +1127,7 @@ def collect(args):
     auto_log = {"ranks": [], "reviews": []}
     if os.getenv("SERPAPI_KEY"):
         restore_serp_log()
-        try: auto_log = serp_collect(asin_list, kw_track, dt.date.today().isoformat(), extra_reviews=page_reviews)
+        try: auto_log = serp_collect(asin_list, kw_track, dt.date.today().isoformat(), extra_reviews=page_reviews, family=family)
         except Exception as e: print(f"  [건너뜀] 순위·평점 자동 조회: {e}")
     real = ranks_in + auto_log["ranks"]
     mw = {(r["keyword"].strip().lower(), min(week_start(r["date"]).isoformat(), weeks[-1].isoformat())) for r in real}
