@@ -4,8 +4,10 @@ name: daily-radar
 on:
   push:
     paths: ["products.enc.json"]   # 상품 탭에서 저장하면 바로 다시 수집
-  schedule:
-    - cron: "0 21 * * *"        # UTC 21:00 = 한국시간 06:00
+  schedule:   # GitHub 예약 실행은 붐비면 몇 시간 늦거나 건너뜀 → 3번 예약, 오늘 이미 갱신됐으면 뒤의 예약은 바로 끝냄
+    - cron: "7 21 * * *"        # 한국시간 06:07
+    - cron: "37 0 * * *"        # 한국시간 09:37 (앞 예약이 건너뛰어졌을 때)
+    - cron: "17 4 * * *"        # 한국시간 13:17 (마지막 안전장치)
   workflow_dispatch: {}          # Actions 탭에서 "Run workflow"로 즉시 실행
 permissions:
   contents: read
@@ -18,17 +20,29 @@ jobs:
     timeout-minutes: 330         # 아마존 광고 리포트는 생성에 최대 3시간 걸릴 수 있음
     environment: { name: github-pages, url: "${{ steps.deploy.outputs.page_url }}" }
     steps:
-      - uses: actions/checkout@v4
+      - name: 오늘 이미 갱신됐는지 확인 (예약 실행만)
+        id: gate
+        run: |
+          today=$(TZ=Asia/Seoul date +%F)
+          last=$(curl -fsSL "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/radar_data.enc.json" 2>/dev/null | python3 -c "import json,sys,datetime as d;g=json.load(sys.stdin).get('generatedAt','');print(d.datetime.fromisoformat(g).astimezone(d.timezone(d.timedelta(hours=9))).date() if g else '')" 2>/dev/null || true)
+          echo "오늘(한국) $today · 사이트 마지막 갱신 ${last:-없음}"
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$last" = "$today" ]; then echo "skip=1" >> "$GITHUB_OUTPUT"; echo "오늘 이미 갱신됨 → 건너뜀"; else echo "skip=0" >> "$GITHUB_OUTPUT"; fi
+      - if: steps.gate.outputs.skip != '1'
+        uses: actions/checkout@v4
       - uses: actions/setup-python@v5
+        if: steps.gate.outputs.skip != '1'
         with: { python-version: "3.12" }
       - run: pip install requests cryptography
+        if: steps.gate.outputs.skip != '1'
       - name: 지난 리포트 캐시 복원 (확정된 기간은 다시 받지 않음)
+        if: steps.gate.outputs.skip != '1'
         uses: actions/cache/restore@v4
         with:
           path: raw
           key: raw-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: raw-
       - name: 아마존 데이터 수집 + 암호화
+        if: steps.gate.outputs.skip != '1'
         env:
           PYTHONUNBUFFERED: "1"   # 진행 기록을 실시간으로 보여줌 (없으면 끝날 때 한꺼번에 나옴)
           LWA_CLIENT_ID: ${{ secrets.LWA_CLIENT_ID }}
@@ -52,16 +66,18 @@ jobs:
           python amazon_connector.py --weeks 13 --encrypt --out radar_data.enc.json
           mkdir -p _site && cp index.html radar_data.enc.json _site/
       - name: 받은 리포트 캐시 저장 (뒤 단계가 실패해도 저장 → 다음 실행이 빨라짐)
-        if: always()
+        if: always() && steps.gate.outputs.skip != '1'
         uses: actions/cache/save@v4
         with:
           path: raw
           key: raw-${{ github.run_id }}-${{ github.run_attempt }}
       - uses: actions/upload-pages-artifact@v3
+        if: steps.gate.outputs.skip != '1'
         with:
           path: _site
           name: github-pages-${{ github.run_attempt }}   # 재실행해도 이름이 겹치지 않게
       - id: deploy
+        if: steps.gate.outputs.skip != '1'
         uses: actions/deploy-pages@v4
         with:
           artifact_name: github-pages-${{ github.run_attempt }}
