@@ -1,4 +1,4 @@
-# 마켓 레이더 — 매일 자동 업데이트 
+# 마켓 레이더 — 매일 자동 업데이트
 # 매일 한국시간 오전 6시: 아마존 API 수집 → 암호화 → GitHub Pages 사이트 갱신
 name: daily-radar
 on:
@@ -30,6 +30,7 @@ jobs:
           restore-keys: raw-
       - name: 아마존 데이터 수집 + 암호화
         env:
+          PYTHONUNBUFFERED: "1"   # 진행 기록을 실시간으로 보여줌 (없으면 끝날 때 한꺼번에 나옴)
           LWA_CLIENT_ID: ${{ secrets.LWA_CLIENT_ID }}
           LWA_CLIENT_SECRET: ${{ secrets.LWA_CLIENT_SECRET }}
           ADS_CLIENT_ID: ${{ secrets.ADS_CLIENT_ID }}
