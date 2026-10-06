@@ -514,19 +514,22 @@ def fba_fees(sp):
     if out: print(f"  · FBA 수수료: {len(out)}개 상품")
     return out
 
+CATALOG = {}   # ASIN → Catalog Items 원본 (상품 현황 탭에 사용)
+
 def catalog_names(sp, asins):
     """SP-API Catalog Items — 실제 상품명·브랜드 (Product Listing 역할). 매일 갱신"""
     out = {}
     for a in asins:
-        pth = os.path.join(RAW, f"catalog_{a}.json"); d = None
-        if os.path.exists(pth) and time.time() - os.path.getmtime(pth) < 86400:
+        pth = os.path.join(RAW, f"catalog2_{a}.json"); d = None
+        if os.path.exists(pth) and time.time() - os.path.getmtime(pth) < 20 * 3600:
             with open(pth, encoding="utf-8") as fp: d = json.load(fp)
         else:
             try:
-                d = sp.get(f"/catalog/2022-04-01/items/{a}", {"marketplaceIds": sp.mp, "includedData": "summaries"})
-                if d: save_raw(f"catalog_{a}.json", d)
+                d = sp.get(f"/catalog/2022-04-01/items/{a}", {"marketplaceIds": sp.mp, "includedData": "summaries,images,attributes,salesRanks"})
+                if d: save_raw(f"catalog2_{a}.json", d)
             except Exception as e:
                 print(f"  [건너뜀] 상품명 {a}: {e}")
+        if d: CATALOG[a] = d
         sm = ((d or {}).get("summaries") or [{}])[0]
         if sm.get("itemName"): out[a] = {"name": sm["itemName"], "brand": sm.get("brandName", "")}
     print(f"  · 상품명 (Catalog Items API): {len(out)}/{len(asins)}개")
@@ -540,6 +543,8 @@ def short_name(title, brand=""):
     t = re.split(r"\s[-|–,(]\s?|,\s|\s\(|\s-\s|\|", t.strip(" -|,"))[0].strip()
     return (t[:27] + "…") if len(t) > 28 else (t or title[:28])
 
+REVIEW_SNIPPETS = {}   # 공식 API 리뷰 발췌 (주제별 최대 3개)
+
 def review_topics(sp, asins):
     """SP-API Customer Feedback API (공식) — 상품별 부정 리뷰 주제·언급률·평점 영향. 주 1회 갱신 데이터."""
     out = {}
@@ -551,7 +556,11 @@ def review_topics(sp, asins):
             d = sp.get(f"/customerFeedback/2024-06-01/items/{a}/reviews/topics", {"marketplaceId": sp.mp, "sortBy": "STAR_RATING_IMPACT"})
             if d: save_raw(f"cf_topics_{a}.json", d)
         if not d: continue
-        neg = (d.get("topics") or {}).get("negativeTopics") or []
+        tp = d.get("topics") or {}
+        REVIEW_SNIPPETS[a] = [{"topic": t.get("topic", ""), "sentiment": sg, "snippets": t.get("reviewSnippets") or [],
+                               "pct": round(f((t.get("asinMetrics") or {}).get("occurrencePercentage")) * (100 if f((t.get("asinMetrics") or {}).get("occurrencePercentage")) <= 1 else 1))}
+                              for sg, key in (("negative", "negativeTopics"), ("positive", "positiveTopics")) for t in (tp.get(key) or [])[:5]]
+        neg = tp.get("negativeTopics") or []
         th = []
         for t in neg[:5]:
             m = t.get("asinMetrics") or {}
@@ -579,9 +588,143 @@ class Serp:
         r = backoff(lambda: requests.get(self.URL, params={"engine": "amazon_product", "asin": asin, "amazon_domain": "amazon.com", "api_key": self.key}, timeout=90))
         r.raise_for_status(); return (r.json().get("product_results") or {})
 
+
+# ---------------------------------------------------------------- 상품 현황 (판매 페이지) · 실제 리뷰
+def _txt(c):
+    return str((c or {}).get("value") or "").strip() if isinstance(c, dict) else ""
+
+def aplus_text(sp, asin):
+    """SP-API A+ Content API (공식) — 우리 상품에 게시된 A+ 문구. 이미지 주소는 API가 주지 않아 문구만 사용. 주 1회"""
+    pth = os.path.join(RAW, f"aplus_{asin}.json")
+    if os.path.exists(pth) and time.time() - os.path.getmtime(pth) < 6 * 86400:
+        with open(pth, encoding="utf-8") as fp: return json.load(fp)
+    out = {"modules": []}
+    rec = sp.get("/aplus/2020-11-01/contentPublishRecords", {"marketplaceId": sp.mp, "asin": asin})
+    keys = [r.get("contentReferenceKey") for r in (rec or {}).get("publishRecordList") or [] if r.get("contentReferenceKey")]
+    for k in keys[:2]:
+        doc = sp.get(f"/aplus/2020-11-01/contentDocuments/{k}", {"marketplaceId": sp.mp, "includedDataSet": "CONTENTS"})
+        cd = ((doc or {}).get("contentRecord") or {}).get("contentDocument") or {}
+        for m in cd.get("contentModuleList") or []:
+            typ = m.get("contentModuleType", ""); body = [v for kk, v in m.items() if kk != "contentModuleType" and isinstance(v, dict)]
+            texts = []
+            def walk(o):
+                if isinstance(o, dict):
+                    if "value" in o and isinstance(o["value"], str): texts.append(o["value"].strip()); return
+                    for v in o.values(): walk(v)
+                elif isinstance(o, list):
+                    for v in o: walk(v)
+            for b in body: walk(b)
+            texts = [t for t in texts if t]
+            if texts: out["modules"].append({"type": typ, "texts": texts[:12]})
+        out["name"] = cd.get("name", ""); out["subType"] = cd.get("contentSubType", ""); out["contentType"] = cd.get("contentType", "")
+    save_raw(f"aplus_{asin}.json", out)
+    return out
+
+def catalog_page(d):
+    """Catalog Items 원본 → 제목·불릿·이미지·카테고리 순위"""
+    if not d: return {}
+    sm = (d.get("summaries") or [{}])[0]; at = d.get("attributes") or {}
+    bullets = [b.get("value") for b in at.get("bullet_point") or [] if b.get("value")]
+    desc = ((at.get("product_description") or [{}])[0]).get("value", "")
+    imgs, seen = [], set()
+    for g in d.get("images") or []:
+        best = {}
+        for im in g.get("images") or []:
+            v = im.get("variant", "")
+            if v not in best or (im.get("width") or 0) > (best[v].get("width") or 0): best[v] = im
+        for v in sorted(best, key=lambda x: (x != "MAIN", x)):
+            u = best[v].get("link")
+            if u and u not in seen: seen.add(u); imgs.append({"variant": v, "url": u})
+        break
+    ranks = []
+    for g in d.get("salesRanks") or []:
+        for r in (g.get("displayGroupRanks") or []) + (g.get("classificationRanks") or []):
+            if r.get("rank"): ranks.append({"title": r.get("title", ""), "rank": r["rank"]})
+    return {"title": sm.get("itemName", ""), "brand": sm.get("brandName", ""), "bullets": bullets, "description": desc[:2000],
+            "images": imgs[:12], "salesRanks": ranks[:3]}
+
+def serp_page_parse(j):
+    """SerpApi amazon_product 결과 → A+ 이미지·영상·리뷰(상위)·리뷰 요약"""
+    pr = j.get("product_results") or {}
+    aplus = []
+    for blk in j.get("product_description") or []:
+        if blk.get("image"): aplus.append({"kind": "image", "image": blk["image"], "title": blk.get("title", "")})
+        if blk.get("carousel_images"):
+            aplus.append({"kind": "carousel", "items": [{"image": c.get("image"), "title": c.get("title", "")} for c in blk["carousel_images"] if c.get("image")]})
+        if blk.get("interactive"):
+            it = blk["interactive"]; aplus.append({"kind": "interactive", "image": it.get("image"), "texts": [{"title": t.get("title", ""), "text": t.get("text", "")} for t in it.get("texts") or []]})
+        if blk.get("compare_with_similar"):
+            aplus.append({"kind": "compare", "items": [{k: v for k, v in c.items() if k not in ("serpapi_link", "position")} for c in blk["compare_with_similar"]][:6]})
+        if blk.get("text") and not blk.get("image"): aplus.append({"kind": "text", "title": blk.get("title", ""), "text": blk["text"]})
+    vids = [{k: v.get(k) for k in ("title", "link", "thumbnail", "duration", "vendor", "date")} for v in j.get("videos") or [] if v.get("link")]
+    ri = j.get("reviews_information") or {}; sm = ri.get("summary") or {}
+    top = []
+    for src, intl in ((ri.get("authors_reviews") or [], False), (ri.get("other_countries_reviews") or [], True)):
+        for r in src:
+            if len(top) >= 10: break
+            top.append({"title": r.get("title", ""), "text": r.get("text", ""), "rating": r.get("rating"), "date": r.get("date", ""),
+                        "author": r.get("author", ""), "verified": bool(r.get("verified_purchase")), "helpful": r.get("helpful_votes", ""),
+                        "images": (r.get("images") or [])[:4], "video": (r.get("video") or {}).get("link"),
+                        "country": ((r.get("country") or {}).get("name") if intl else ""), "intl": intl})
+    ins = [{"title": i.get("title", ""), "sentiment": i.get("sentiment", ""), "total": (i.get("mentions") or {}).get("total"),
+            "pos": (i.get("mentions") or {}).get("positive"), "neg": (i.get("mentions") or {}).get("negative"),
+            "summary": i.get("summary", ""), "examples": [e.get("snippet", "") for e in (i.get("examples") or [])[:2]]} for i in sm.get("insights") or []]
+    return {"aplus": aplus, "videos": vids[:12], "bullets": pr.get("about_item") or [], "thumbnails": (pr.get("thumbnails") or [])[:12],
+            "title": pr.get("title", ""), "rating": pr.get("rating"), "reviews": pr.get("reviews"), "badges": pr.get("badges") or [],
+            "price": pr.get("extracted_price"), "bought": pr.get("bought_last_month", ""),
+            "reviewSummary": sm.get("text", ""), "insights": ins[:10], "dist": sm.get("customer_reviews") or {}, "top": top}
+
+def serp_pages(asins, today, prev=None, max_new=10, max_refresh=2, every=7):
+    """SerpApi로 우리 상품 판매 페이지(A+ 이미지·영상·상위 리뷰)를 주 1회 받음. 처음엔 전부, 이후 하루 최대 2개만 갱신 → 월 약 35회"""
+    out, prev = {}, prev or {}
+    cli = None; used = 0; fresh = 0; refreshed = 0
+    for a in asins:
+        pth = os.path.join(RAW, f"serp_page_{a}.json"); j = None
+        if os.path.exists(pth):
+            with open(pth, encoding="utf-8") as fp: j = json.load(fp)
+        elif prev.get(a, {}).get("serp"):
+            out[a] = prev[a]["serp"]; j = {"_parsed": prev[a]["serp"]}
+        age = (dt.date.fromisoformat(today) - dt.date.fromisoformat((j or {}).get("_date") or (j or {}).get("_parsed", {}).get("fetched") or "2000-01-01")).days
+        need = j is None and fresh < max_new or (j is not None and age >= every and refreshed < max_refresh)
+        if need:
+            try:
+                if cli is None:
+                    cli = Serp()
+                    if cli.left() < 15: print("  [안내] SerpApi 남은 횟수 부족 → 판매 페이지 갱신 건너뜀"); need = False
+                if need:
+                    import requests
+                    r = backoff(lambda: requests.get(Serp.URL, params={"engine": "amazon_product", "asin": a, "amazon_domain": "amazon.com", "api_key": cli.key}, timeout=120))
+                    r.raise_for_status(); raw = r.json(); used += 1
+                    j = {"_date": today, "_parsed": dict(serp_page_parse(raw), fetched=today)}
+                    save_raw(f"serp_page_{a}.json", j)
+                    if age > 9000: fresh += 1
+                    else: refreshed += 1
+            except Exception as e:
+                print(f"  [건너뜀] 판매 페이지 {a}: {e}")
+        if j and j.get("_parsed"): out[a] = j["_parsed"]
+    print(f"  · 판매 페이지 (SerpApi): {len(out)}/{len(asins)}개 상품, 오늘 {used}회 사용")
+    return out, used
+
+def build_listing(asins, serp, aplus_sp):
+    """상품 현황 탭 데이터: 공식 API(제목·불릿·이미지·A+ 문구) + SerpApi(A+ 이미지·영상·상위 리뷰)"""
+    L = {}
+    for a in asins:
+        c = catalog_page(CATALOG.get(a)); s = serp.get(a) or {}; ap = aplus_sp.get(a) or {}
+        imgs = c.get("images") or [{"variant": "", "url": u} for u in s.get("thumbnails") or []]
+        L[a] = {"title": c.get("title") or s.get("title", ""), "brand": c.get("brand", ""),
+                "bullets": c.get("bullets") or s.get("bullets") or [], "description": c.get("description", ""),
+                "images": imgs, "salesRanks": c.get("salesRanks") or [],
+                "aplus": s.get("aplus") or [], "aplusText": ap.get("modules") or [], "aplusType": ap.get("contentType", ""),
+                "videos": s.get("videos") or [], "badges": s.get("badges") or [], "bought": s.get("bought", ""),
+                "rating": s.get("rating"), "reviewsCount": s.get("reviews"),
+                "reviews": {"summary": s.get("reviewSummary", ""), "insights": s.get("insights") or [], "dist": s.get("dist") or {}, "top": s.get("top") or []},
+                "fetched": s.get("fetched", ""), "serp": s or None,
+                "src": {"catalog": bool(c), "serp": bool(s), "aplusApi": bool(ap.get("modules"))}}
+    return L
+
 SERP_LOG = os.path.join(RAW, "serp_log.json")
 
-def serp_collect(asins, keywords, today, budget_month=240):
+def serp_collect(asins, keywords, today, budget_month=200, extra_reviews=None):
     """무료 한도(월 250회) 안에서 매일 자동 배분: 키워드 순위 1~2페이지 + 검색에 안 보인 상품은 상품 페이지로 평점 확인.
        결과는 raw/serp_log.json에 날짜별로 누적 (캐시가 지워져도 사이트의 지난 데이터에서 복원)."""
     log = {"ranks": [], "reviews": []}
@@ -589,6 +732,8 @@ def serp_collect(asins, keywords, today, budget_month=240):
         with open(SERP_LOG, encoding="utf-8") as fp: log = json.load(fp)
     if any(r["date"] == today for r in log["ranks"]) or any(r["date"] == today for r in log["reviews"]):
         print("  · 오늘 순위·평점은 이미 조회함 (재실행 시 무료 한도 절약)"); return log
+    for r in extra_reviews or []:   # 판매 페이지에서 오늘 받은 평점은 그대로 기록 (추가 호출 없음)
+        log["reviews"].append(r)
     cli = Serp(); left = cli.left()
     import calendar
     d = dt.date.fromisoformat(today); days_left = calendar.monthrange(d.year, d.month)[1] - d.day + 1
@@ -884,6 +1029,20 @@ def collect(args):
         if nm:
             if not c.get("name"): c["name"] = nm["name"][:80]
             if not c.get("short") or c["short"] == c["asin"][-5:]: c["short"] = short_name(nm["name"], nm["brand"] or brand)
+    # 상품 현황 (판매 페이지): 공식 A+ 문구 + SerpApi A+ 이미지·영상·상위 리뷰
+    aplus_sp = {}
+    for a in asin_list:
+        try: aplus_sp[a] = aplus_text(sp, a)
+        except Exception as e: print(f"  [건너뜀] A+ 문구 {a}: {e}")
+    print(f"  · A+ 문구 (A+ Content API): {sum(1 for v in aplus_sp.values() if v.get('modules'))}/{len(asin_list)}개 상품")
+    serp_pg, page_reviews = {}, []
+    if os.getenv("SERPAPI_KEY"):
+        try:
+            serp_pg, _ = serp_pages(asin_list, dt.date.today().isoformat(), (prev_site_data() or {}).get("listing"))
+            page_reviews = [{"asin": a, "date": v["fetched"], "rating": v["rating"], "reviews": v["reviews"]}
+                            for a, v in serp_pg.items() if v.get("rating") and v.get("fetched") == dt.date.today().isoformat()]
+        except Exception as e: print(f"  [건너뜀] 판매 페이지: {e}")
+    listing = build_listing(asin_list, serp_pg, aplus_sp)
     user_kw = {}   # 상품 탭에서 입력한 키워드 → 상품
     for a, pz in P.items():
         if pz.get("exclude"): continue
@@ -897,7 +1056,7 @@ def collect(args):
     auto_log = {"ranks": [], "reviews": []}
     if os.getenv("SERPAPI_KEY"):
         restore_serp_log()
-        try: auto_log = serp_collect(asin_list, kw_track, dt.date.today().isoformat())
+        try: auto_log = serp_collect(asin_list, kw_track, dt.date.today().isoformat(), extra_reviews=page_reviews)
         except Exception as e: print(f"  [건너뜀] 순위·평점 자동 조회: {e}")
     real = ranks_in + auto_log["ranks"]
     mw = {(r["keyword"].strip().lower(), min(week_start(r["date"]).isoformat(), weeks[-1].isoformat())) for r in real}
@@ -923,6 +1082,7 @@ def collect(args):
            "campaigns": build_campaigns(sp_c, sb_c, sd_c, costs), "searchTerms": build_terms(terms, brand),
            "keywords": build_keywords(weeks, ranks_in, sqp, brand, tos),
            "autoLog": auto_log,
+           "listing": listing,
            "productSettings": settings,
            "allProducts": [{"asin": a, "excluded": a in excluded, "sales13w": round(tot.get(a, 0)),
                             "name": (names.get(a) or {}).get("name") or (fees.get(a) or {}).get("name") or inventory.get(a, {}).get("product-name", ""),
@@ -942,6 +1102,8 @@ def collect(args):
         it["daily"] = {"units": [int(x) for x in g("units")], "sales": g("sales"), "sessions": [int(x) for x in g("sessions")], "buyBox": g("buyBox")}
         if use_ads:
             it["daily"]["adSpend"] = [round(ad_day[a][i][0], 2) for i in D_ISO]; it["daily"]["adSales"] = [round(ad_day[a][i][1], 2) for i in D_ISO]
+    for a, v in out["listing"].items():
+        v["officialSnippets"] = REVIEW_SNIPPETS.get(a) or []
     for it in out["asins"]:
         if it["asin"] in themes:
             it["reviewThemes"] = [[t, sh] for t, sh, _ in themes[it["asin"]]]
