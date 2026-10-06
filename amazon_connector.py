@@ -718,7 +718,8 @@ def serp_page_parse(j):
             top.append({"title": r.get("title", ""), "text": r.get("text", ""), "rating": r.get("rating"), "date": r.get("date", ""),
                         "author": r.get("author", ""), "verified": bool(r.get("verified_purchase")), "helpful": r.get("helpful_votes", ""),
                         "images": (r.get("images") or [])[:4], "video": (r.get("video") or {}).get("link"),
-                        "country": ((r.get("country") or {}).get("name") if intl else ""), "intl": intl})
+                        "country": ((r.get("country") or {}).get("name") if intl else ""), "intl": intl,
+                        "vine": "vine" in json.dumps({k: v for k, v in r.items() if k not in ("text",)}, ensure_ascii=False).lower() or "vine customer review" in (r.get("text") or "").lower()})
     ins = [{"title": i.get("title", ""), "sentiment": i.get("sentiment", ""), "total": (i.get("mentions") or {}).get("total"),
             "pos": (i.get("mentions") or {}).get("positive"), "neg": (i.get("mentions") or {}).get("negative"),
             "summary": i.get("summary", ""), "examples": [e.get("snippet", "") for e in (i.get("examples") or [])[:2]]} for i in sm.get("insights") or []]
@@ -835,6 +836,99 @@ def serp_collect(asins, keywords, today, budget_month=200, extra_reviews=None, f
     with open(SERP_LOG, "w", encoding="utf-8") as fp: json.dump(log, fp, ensure_ascii=False)
     print(f"  · SerpApi {used}회 사용 (남은 {left - used}회): 순위 {len(todays)}개 키워드 · 평점 {len(seen)}개 상품")
     return log
+
+SOL_LOG = os.path.join(RAW, "solicit_log.json")
+
+def review_requests(sp, today, cfg, prev=None, max_orders=None):
+    """아마존 공식 '리뷰 요청하기'(Solicitations API)를 매일 자동 발송.
+       - 배송 후 5~30일 주문만 아마존이 허용 → 매일 '보낼 수 있는지' 아마존에 묻고, 가능하면 보냄 (주문당 1회)
+       - 문구는 아마존 고정 문구 (우리가 바꿀 수 없음 = 정책 위반 위험 없음)
+       - 필요 권한: Buyer Solicitation 또는 Product Listing 역할
+       cfg = 상품 설정의 reviewRequest {on, skip:[asin]}.  꺼져 있으면 기록만 보여 주고 보내지 않음"""
+    import requests
+    log = {}
+    if os.path.exists(SOL_LOG):
+        with open(SOL_LOG, encoding="utf-8") as fp: log = json.load(fp)
+    elif prev: log = dict(prev)
+    state = {"enabled": bool(cfg.get("on")), "checked": today, "error": ""}
+    if not cfg.get("on"):
+        print("  · 리뷰 요청 자동 발송: 꺼짐 (대시보드 '리뷰 확보' 탭에서 켤 수 있음)")
+        return log, state
+    d0 = dt.date.fromisoformat(today); skip = set(cfg.get("skip") or [])
+    rows = None
+    try:   # ① 주문 리포트 (상품 ASIN 포함)
+        raw = sp.report("GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL", f"{(d0 - dt.timedelta(days=40)).isoformat()}T00:00:00Z",
+                        f"{(d0 - dt.timedelta(days=4)).isoformat()}T23:59:59Z", tag="now")
+        rows = tsv(raw) if isinstance(raw, str) else None
+    except Exception as e: print(f"  [안내] 주문 리포트 실패 → 주문 API로 대신 받음: {e}")
+    if rows is None:   # ② 주문 API (Product Listing 역할로도 가능, 상품 ASIN은 없음)
+        rows, tok = [], None
+        try:
+            for _ in range(15):
+                prm = {"MarketplaceIds": sp.mp, "OrderStatuses": "Shipped", "MaxResultsPerPage": 100,
+                       "CreatedAfter": f"{(d0 - dt.timedelta(days=40)).isoformat()}T00:00:00Z", "CreatedBefore": f"{(d0 - dt.timedelta(days=4)).isoformat()}T23:59:59Z"}
+                if tok: prm = {"MarketplaceIds": sp.mp, "NextToken": tok}
+                j = sp.get("/orders/v0/orders", prm)
+                if j is None: raise RuntimeError("주문 API 권한 없음")
+                pl = j.get("payload") or {}
+                for o in pl.get("Orders") or []:
+                    rows.append({"amazon-order-id": o.get("AmazonOrderId"), "order-status": "shipped", "purchase-date": o.get("PurchaseDate", ""),
+                                 "sales-channel": o.get("SalesChannel", "Amazon.com"), "asin": ""})
+                tok = pl.get("NextToken")
+                if not tok: break
+                time.sleep(61)   # 주문 API 허용 속도: 1분에 1회
+        except Exception as e:
+            state["error"] = f"주문 목록을 받지 못함: {e}"; print(f"  [건너뜀] 리뷰 요청: {state['error']}"); return log, state
+    orders = {}
+    for r in rows:
+        oid = r.get("amazon-order-id"); st = (r.get("order-status") or "").lower(); ist = (r.get("item-status") or "").lower()
+        if not oid or "cancel" in st or "cancel" in ist or st not in ("shipped", "complete", ""): continue
+        if (r.get("sales-channel") or "Amazon.com").lower().startswith("non-amazon"): continue
+        o = orders.setdefault(oid, {"asin": r.get("asin", ""), "purchase": (r.get("purchase-date") or "")[:10]})
+    todo = []
+    for oid, o in orders.items():
+        x = log.get(oid)
+        if x and x.get("s") in ("sent", "expired", "skip", "na"): continue
+        if not o["purchase"]: continue
+        age = (d0 - dt.date.fromisoformat(o["purchase"])).days
+        if o["asin"] in skip:
+            log[oid] = {"a": o["asin"], "p": o["purchase"], "s": "skip", "d": today}; continue
+        if age > 38:
+            log[oid] = {"a": o["asin"], "p": o["purchase"], "s": "expired", "d": today}; continue
+        todo.append((age, oid, o))
+    todo.sort(reverse=True)   # 기한이 먼저 끝나는(오래된) 주문부터
+    cap = int(max_orders or os.getenv("MAX_REVIEW_REQUESTS", "300"))
+    sent = notyet = err = 0
+    for age, oid, o in todo[:cap]:
+        rec = log.get(oid) or {"a": o["asin"], "p": o["purchase"]}
+        try:
+            time.sleep(1.05)   # 아마존 허용 속도: 초당 1회
+            g = backoff(lambda: requests.get(f"{sp.host}/solicitations/v1/orders/{oid}", headers=sp.h, params={"marketplaceIds": sp.mp}, timeout=30))
+            if g.status_code in (401, 403):
+                sp.renew(); g = backoff(lambda: requests.get(f"{sp.host}/solicitations/v1/orders/{oid}", headers=sp.h, params={"marketplaceIds": sp.mp}, timeout=30))
+            if g.status_code == 403:
+                state["error"] = "권한 없음 — 개발자 프로필에서 'Buyer Solicitation' 또는 'Product Listing' 역할을 켜고 앱을 다시 승인(Authorize)해야 합니다"
+                print(f"  [중단] 리뷰 요청: {state['error']}"); break
+            acts = [a.get("name", "") for a in ((g.json() or {}).get("_links") or {}).get("actions") or []] if g.ok else []
+            if "productReviewAndSellerFeedback" in acts:
+                time.sleep(1.05)
+                p_ = backoff(lambda: requests.post(f"{sp.host}/solicitations/v1/orders/{oid}/solicitations/productReviewAndSellerFeedback",
+                                                   headers=sp.h, params={"marketplaceIds": sp.mp}, timeout=30))
+                if p_.status_code in (200, 201): rec.update(s="sent", d=today); sent += 1
+                else: rec.update(s="error", d=today, e=str(p_.status_code)); err += 1
+            else:
+                # 아직 배송 후 5일 전이면 내일 다시 확인. 14일이 지나도 안 되면 이미 요청했거나(셀러센트럴 버튼) 대상 아님 → 그만 확인
+                rec.update(s="na" if age >= 14 else "wait", d=today); notyet += 1
+        except Exception as e:
+            rec.update(s="error", d=today, e=str(e)[:80]); err += 1
+        log[oid] = rec
+    cut = (d0 - dt.timedelta(days=120)).isoformat()
+    log = {k: v for k, v in log.items() if (v.get("p") or "") >= cut}
+    os.makedirs(RAW, exist_ok=True)
+    with open(SOL_LOG, "w", encoding="utf-8") as fp: json.dump(log, fp)
+    state.update(sent=sent, wait=notyet, err=err, checkedOrders=min(len(todo), cap), pending=max(0, len(todo) - cap))
+    print(f"  · 리뷰 요청 자동 발송: 오늘 {sent}건 보냄 · 아직 기간 전 {notyet}건 · 실패 {err}건 (확인한 주문 {min(len(todo), cap)}건)")
+    return log, state
 
 def restore_serp_log():
     """GitHub 캐시가 지워졌을 때 지난번 사이트(암호화 파일)에서 순위·평점 기록 복원"""
@@ -1138,6 +1232,9 @@ def collect(args):
     ranks_in = [dict(r, **{k: v for k, v in meta_by.get(r["keyword"].strip().lower(), {}).items() if k in ("key", "target") and v}) for r in ranks_in]
     reviews_in = [r for r in reviews_in if r.get("rating")]
 
+    try: sol_log, sol_state = review_requests(sp, dt.datetime.now(KST).date().isoformat(), settings.get("reviewRequest") or {},
+                                              ((prev_site_data() or {}).get("reviewOps") or {}).get("orders"))
+    except Exception as e: sol_log, sol_state = {}, {"enabled": False, "error": str(e)[:120]}; print(f"  [건너뜀] 리뷰 요청: {e}")
     print("[3/3] 환율 · 합치기 · 변환")
     as_of = dt.datetime.now(KST).date()
     fxd = fx_rates(weeks[0], max(as_of, days[-1]))
@@ -1153,6 +1250,7 @@ def collect(args):
            "campaigns": build_campaigns(sp_c, sb_c, sd_c, costs), "searchTerms": build_terms(terms, brand),
            "keywords": build_keywords(weeks, ranks_in, sqp, brand, tos),
            "autoLog": auto_log,
+           "reviewOps": dict(sol_state, orders=sol_log),
            "listing": listing,
            "productSettings": settings,
            "allProducts": [{"asin": a, "excluded": a in excluded, "sales13w": round(tot.get(a, 0)),
