@@ -1,0 +1,33 @@
+# 광고 자료 업로드 → 1~2분 안에 사이트에 반영 (아마존 수집은 다시 하지 않음)
+# 대시보드 › 광고 › 자료 올리기에서 저장하면 ads_data.enc.json 이 바뀌고, 이 작업이 사이트 파일만 다시 올립니다.
+name: ads-publish
+on:
+  push:
+    paths: ["ads_data.enc.json"]
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency: { group: radar, cancel-in-progress: false }   # 매일 수집과 겹치면 끝난 뒤 실행
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: { name: github-pages, url: "${{ steps.deploy.outputs.page_url }}" }
+    steps:
+      - uses: actions/checkout@v4
+      - name: 지금 사이트의 아마존 데이터 + 새 광고 자료로 사이트 묶기
+        run: |
+          mkdir -p _site
+          curl -fsSL "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/radar_data.enc.json" -o _site/radar_data.enc.json
+          python3 -c "import json;json.load(open('_site/radar_data.enc.json'))"
+          cp index.html ads_data.enc.json _site/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+          name: github-pages-ads-${{ github.run_attempt }}
+      - id: deploy
+        uses: actions/deploy-pages@v4
+        with:
+          artifact_name: github-pages-ads-${{ github.run_attempt }}
