@@ -3,7 +3,7 @@
 name: daily-radar
 on:
   push:
-    paths: ["products.enc.json"]   # 상품 탭에서 저장하면 바로 다시 수집
+    paths: ["products.enc.json"]   # 상품 탭에서 저장하면 바로 다시 수집 (광고 업로드는 사이트가 바로 읽으므로 재수집 불필요)
   schedule:   # GitHub 예약 실행은 붐비면 몇 시간 늦거나 건너뜀 → 3번 예약, 오늘 이미 갱신됐으면 뒤의 예약은 바로 끝냄
     - cron: "7 21 * * *"        # 한국시간 06:07
     - cron: "37 0 * * *"        # 한국시간 09:37 (앞 예약이 건너뛰어졌을 때)
@@ -58,6 +58,8 @@ jobs:
           RANKS_CSV: ${{ secrets.RANKS_CSV }}
           REVIEWS_CSV: ${{ secrets.REVIEWS_CSV }}
           IPI_SCORE: ${{ vars.IPI_SCORE }}
+          SEARCH_TERMS: ${{ vars.SEARCH_TERMS }}
+          STR_WAIT_MIN: ${{ vars.STR_WAIT_MIN }}
           FX_FALLBACK: ${{ secrets.FX_FALLBACK }}
           KEYWORDS_CSV: ${{ secrets.KEYWORDS_CSV }}
           SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
@@ -65,6 +67,7 @@ jobs:
         run: |
           python amazon_connector.py --weeks 13 --encrypt --out radar_data.enc.json
           mkdir -p _site && cp index.html radar_data.enc.json _site/
+          if [ -f ads_data.enc.json ]; then cp ads_data.enc.json _site/; fi   # 광고 업로드 자료 (팀원이 토큰 없이도 읽음)
       - name: 받은 리포트 캐시 저장 (뒤 단계가 실패해도 저장 → 다음 실행이 빨라짐)
         if: always() && steps.gate.outputs.skip != '1'
         uses: actions/cache/save@v4
