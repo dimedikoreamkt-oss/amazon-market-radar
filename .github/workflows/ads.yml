@@ -22,7 +22,13 @@ jobs:
           mkdir -p _site
           curl -fsSL "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/radar_data.enc.json" -o _site/radar_data.enc.json
           python3 -c "import json;json.load(open('_site/radar_data.enc.json'))"
-          cp index.html ads_data.enc.json _site/
+          cp index.html _site/
+          if [ -f ads_data.enc.json ]; then
+            cp ads_data.enc.json _site/
+            echo "광고 자료 반영: $(stat -c%s ads_data.enc.json) bytes"
+          else
+            echo "::notice::아직 광고 자료(ads_data.enc.json)가 없습니다. 사이트 › 광고 › 자료 올리기에서 CSV를 저장하면 자동으로 다시 실행됩니다."
+          fi
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site
