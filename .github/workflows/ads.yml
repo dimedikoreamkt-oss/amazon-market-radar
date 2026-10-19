@@ -1,9 +1,9 @@
-# 광고 자료 업로드 → 1~2분 안에 사이트에 반영 (아마존 수집은 다시 하지 않음)
+# 광고 자료 업로드 · index.html 교체 → 1~2분 안에 사이트에 반영 (아마존 수집은 다시 하지 않음)
 # 대시보드 › 광고 › 자료 올리기에서 저장하면 ads_data.enc.json 이 바뀌고, 이 작업이 사이트 파일만 다시 올립니다.
 name: ads-publish
 on:
   push:
-    paths: ["ads_data.enc.json"]
+    paths: ["ads_data.enc.json", "index.html"]   # 광고 자료 저장 또는 대시보드 파일 교체 시 자동 실행
   workflow_dispatch: {}
 permissions:
   contents: read
